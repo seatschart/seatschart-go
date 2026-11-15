@@ -1,0 +1,867 @@
+<!-- seatschart:intro -->
+# SeatsChart Go SDK
+
+Official SeatsChart Go SDK for the SeatsChart seating API: seat maps, holds, reservations and ticketing inventory, with automatic retries and idempotency keys.
+
+```sh
+go get github.com/seatschart/seatschart-go
+```
+
+Server-to-server only: authenticate with an `x-api-key` and never ship it to a browser. Write calls take an `Idempotency-Key` (see below); `429` and `503` responses are retried with backoff, and every attempt times out after 30 s (10 s to connect), as seats.io's SDKs (see the retry runtime of this package).
+
+License: MIT. Issues and questions: seatschart@gmail.com.
+
+## Hold → confirm → release
+
+Hold seats for a buyer, confirm them once your payment provider charged the buyer, or release them when the payment fails. Confirm and release present the hold token the hold returned; confirm is server-side only.
+
+```go
+// import ("context"; "encoding/json"; "net/http"; "os"; seatschart "github.com/seatschart/seatschart-go")
+cfg := seatschart.NewConfiguration()
+cfg.Servers = seatschart.ServerConfigurations{{URL: "https://api.seatschart.com"}}
+cfg.HTTPClient = seatschart.NewRetryingHTTPClient(nil, seatschart.DefaultRetryPolicy())
+client := seatschart.NewAPIClient(cfg)
+ctx := context.WithValue(context.Background(), seatschart.ContextAPIKeys,
+	map[string]seatschart.APIKey{"ApiKeyAuth": {Key: os.Getenv("SEATSCHART_API_KEY")}})
+// body reads the JSON of a response (the operations declare no response schema).
+body := func(res *http.Response, err error) (map[string]any, error) {
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	out := map[string]any{}
+	return out, json.NewDecoder(res.Body).Decode(&out)
+}
+
+// 1. Hold the seats: the response carries the hold token of this buyer session.
+hold, err := body(client.SeatsAPI.PostApiSeatsReserve(ctx).IdempotencyKey(seatschart.NewIdempotencyKey()).
+	PostApiSeatsReserveRequest(*seatschart.NewPostApiSeatsReserveRequest(eventID, seatIDs, "buyer-42")).Execute())
+if err != nil {
+	return err
+}
+token, _ := hold["hold_token"].(string)
+// 2. After your PSP charged the buyer: confirm with the same hold token (202, order committed asynchronously).
+confirm := seatschart.NewPostApiSeatsConfirmRequest(eventID, seatIDs, "buyer-42")
+confirm.SetHoldToken(token)
+confirm.SetExternalOrderId("order-1001")
+if _, err := body(client.SeatsAPI.PostApiSeatsConfirm(ctx).IdempotencyKey("confirm-order-1001").
+	PostApiSeatsConfirmRequest(*confirm).Execute()); err != nil {
+	// 3. Payment failed or the buyer left: release the seats now instead of waiting for the hold to expire.
+	release := seatschart.NewPostApiSeatsReleaseRequest(eventID, seatIDs, "buyer-42")
+	release.SetHoldToken(token)
+	_, _ = body(client.SeatsAPI.PostApiSeatsRelease(ctx).IdempotencyKey(seatschart.NewIdempotencyKey()).
+		PostApiSeatsReleaseRequest(*release).Execute())
+	return err
+}
+```
+
+## Idempotency keys
+
+Every write (`reserve`, `confirm`, `release`, hold tokens, object status and for-sale changes) takes an `Idempotency-Key`. Use a fresh key per operation and the same key for every retry of that operation: a replay with the same key and body returns the stored response instead of applying it twice, a different body under the same key is refused with `409 idempotency_conflict`. The retry runtime of this package resends the key unchanged on `429` and `503`.
+
+```go
+// One key per business operation, stored with your order and reused on every retry of it.
+key := "confirm-" + orderID
+call := func() (*http.Response, error) {
+	return client.SeatsAPI.PostApiSeatsConfirm(ctx).IdempotencyKey(key).PostApiSeatsConfirmRequest(*confirm).Execute()
+}
+_, err := call() // first attempt (times out?)
+_, err = call()  // same key + same body: the stored response
+```
+
+## Timeouts
+
+Every attempt has a 10 s connect timeout and a 30 s request timeout by default. A timed-out attempt is retried like a `503` when the request is safe to repeat (GET, PUT, DELETE, or a write carrying an `Idempotency-Key`, which is resent unchanged); otherwise, or after the last attempt, the call fails with a typed timeout error (code `timeout`). The outcome on the server is then unknown: retry the operation later with the same key.
+
+```go
+// Defaults: 10 s to connect, 30 s per attempt until the body is read (0 turns one off).
+policy := seatschart.DefaultRetryPolicy()
+policy.ConnectTimeout = 5 * time.Second
+policy.Timeout = 20 * time.Second
+cfg.HTTPClient = seatschart.NewRetryingHTTPClient(nil, policy)
+if _, err := call(); seatschart.IsTimeout(err) { // a *seatschart.TimeoutError (Code() == "timeout"): the outcome is unknown
+	// retry later with the same key
+}
+```
+
+## One workspace per organizer
+
+Ticketing platforms give each organizer its own workspace and operate all of them with one workspace admin key. `forWorkspace` scopes a client to one workspace (its id or external id) with `X-Workspace-Key`; the `Workspaces` helper provisions an organizer (`externalId`, `templateWorkspaceId`, `issueKey`, always with an `Idempotency-Key`) and covers `getByExternalId`, keys, members, invitations and the consolidated overview. The generated `WorkspaceApi` methods stay available.
+
+```go
+ws := client.Workspaces() // client: an APIClient with the workspace admin key
+body := seatschart.NewPostApiWorkspacesRequest("Teatro Aurora")
+body.SetExternalId("org-1042")
+body.SetTemplateWorkspaceId("org-template")
+issue := seatschart.NewPostApiWorkspacesRequestIssueKey()
+issue.SetName("Server key")
+body.SetIssueKey(*issue)
+created, _, err := ws.Create(ctx, *body, "provision-org-1042")
+org, err := client.ForWorkspace("org-1042") // every call through org sends X-Workspace-Key
+issued := created.GetApiKey()
+_, _, err = ws.Keys.Rotate(ctx, "org-1042", issued.GetId())
+_, _, err = ws.Invitations.Create(ctx, "org-1042",
+	*seatschart.NewPostApiWorkspacesByWorkspaceIdInvitationsRequest("box-office@teatro-aurora.example", "viewer"))
+rows, err := ws.ListAllOverview(ctx, func(r seatschart.ApiGetApiWorkspacesOverviewRequest) seatschart.ApiGetApiWorkspacesOverviewRequest {
+	return r.CreatedByApi(true)
+})
+```
+
+<!-- seatschart:intro -->
+
+# Go API client for seatschart
+
+Seat inventory and locking API for B2B2C integrations. Authenticate using `x-api-key` (partners) or `Authorization: Bearer` with an HS256 JWT.
+
+## Overview
+This API client was generated by the [OpenAPI Generator](https://openapi-generator.tech) project.  By using the [OpenAPI-spec](https://www.openapis.org/) from a remote server, you can easily generate an API client.
+
+- API version: 1.0.0
+- Package version: 0.6.0
+- Generator version: 7.11.0
+- Build package: org.openapitools.codegen.languages.GoClientCodegen
+
+## Installation
+
+```sh
+go get github.com/seatschart/seatschart-go
+```
+
+```go
+import seatschart "github.com/seatschart/seatschart-go"
+```
+
+To use a proxy, set the environment variable `HTTP_PROXY`.
+
+## Configuration of Server URL
+
+Default configuration comes with `Servers` field that contains server objects as defined in the OpenAPI specification.
+
+### Select Server Configuration
+
+For using other server than the one defined on index 0 set context value `seatschart.ContextServerIndex` of type `int`.
+
+```go
+ctx := context.WithValue(context.Background(), seatschart.ContextServerIndex, 1)
+```
+
+### Templated Server URL
+
+Templated server URL is formatted using default variables from configuration or from context value `seatschart.ContextServerVariables` of type `map[string]string`.
+
+```go
+ctx := context.WithValue(context.Background(), seatschart.ContextServerVariables, map[string]string{
+	"basePath": "v2",
+})
+```
+
+Note, enum values are always validated and all unused variables are silently ignored.
+
+### URLs Configuration per Operation
+
+Each operation can use different server URL defined using `OperationServers` map in the `Configuration`.
+An operation is uniquely identified by `"{classname}Service.{nickname}"` string.
+Similar rules for overriding default operation server index and variables applies by using `seatschart.ContextOperationServerIndices` and `seatschart.ContextOperationServerVariables` context maps.
+
+```go
+ctx := context.WithValue(context.Background(), seatschart.ContextOperationServerIndices, map[string]int{
+	"{classname}Service.{nickname}": 2,
+})
+ctx = context.WithValue(context.Background(), seatschart.ContextOperationServerVariables, map[string]map[string]string{
+	"{classname}Service.{nickname}": {
+		"port": "8443",
+	},
+})
+```
+
+## Documentation for API Endpoints
+
+All URIs are relative to *http://localhost*
+
+Class | Method | HTTP request | Description
+------------ | ------------- | ------------- | -------------
+*ApiKeysAPI* | [**DeleteApiKeysById**](docs/ApiKeysAPI.md#deleteapikeysbyid) | **Delete** /api/keys/{id} | Soft-revoke an API key
+*ApiKeysAPI* | [**GetApiKeys**](docs/ApiKeysAPI.md#getapikeys) | **Get** /api/keys | List active tenant API keys (prefix fingerprint only)
+*ApiKeysAPI* | [**GetApiKeysScopes**](docs/ApiKeysAPI.md#getapikeysscopes) | **Get** /api/keys/scopes | List API key scopes and presets
+*ApiKeysAPI* | [**PatchApiKeysById**](docs/ApiKeysAPI.md#patchapikeysbyid) | **Patch** /api/keys/{id} | Rename an API key, change its scopes or its workspace admin capability
+*ApiKeysAPI* | [**PostApiKeys**](docs/ApiKeysAPI.md#postapikeys) | **Post** /api/keys | Mint a tenant API key (secret returned once)
+*AssetsAPI* | [**GetAssetsMapByTenantIdByEventIdByFilename**](docs/AssetsAPI.md#getassetsmapbytenantidbyeventidbyfilename) | **Get** /assets/map/{tenantId}/{eventId}/{filename} | Serve persisted map reference/background images
+*AuditAPI* | [**GetApiAuditLogs**](docs/AuditAPI.md#getapiauditlogs) | **Get** /api/audit-logs | List recent workspace audit log entries
+*AuthAPI* | [**GetApiAuth2fa**](docs/AuthAPI.md#getapiauth2fa) | **Get** /api/auth/2fa | Two-factor status of the signed-in user
+*AuthAPI* | [**GetApiAuthInviteByToken**](docs/AuthAPI.md#getapiauthinvitebytoken) | **Get** /api/auth/invite/{token} | Preview invitation metadata
+*AuthAPI* | [**GetApiAuthMe**](docs/AuthAPI.md#getapiauthme) | **Get** /api/auth/me | Current dashboard user
+*AuthAPI* | [**PostApiAuth2faDisable**](docs/AuthAPI.md#postapiauth2fadisable) | **Post** /api/auth/2fa/disable | Disable two-factor authentication
+*AuthAPI* | [**PostApiAuth2faEnable**](docs/AuthAPI.md#postapiauth2faenable) | **Post** /api/auth/2fa/enable | Confirm enrolment and enable two-factor authentication
+*AuthAPI* | [**PostApiAuth2faEnrollConfirm**](docs/AuthAPI.md#postapiauth2faenrollconfirm) | **Post** /api/auth/2fa/enroll/confirm | Confirm the required enrolment and finish signing in
+*AuthAPI* | [**PostApiAuth2faEnrollStart**](docs/AuthAPI.md#postapiauth2faenrollstart) | **Post** /api/auth/2fa/enroll/start | Start the enrolment required by the workspace (during sign-in)
+*AuthAPI* | [**PostApiAuth2faRecoveryCodes**](docs/AuthAPI.md#postapiauth2farecoverycodes) | **Post** /api/auth/2fa/recovery-codes | Replace the recovery codes
+*AuthAPI* | [**PostApiAuth2faSetup**](docs/AuthAPI.md#postapiauth2fasetup) | **Post** /api/auth/2fa/setup | Start two-factor enrolment
+*AuthAPI* | [**PostApiAuth2faVerify**](docs/AuthAPI.md#postapiauth2faverify) | **Post** /api/auth/2fa/verify | Complete sign-in with a two-factor code
+*AuthAPI* | [**PostApiAuthAcceptInvite**](docs/AuthAPI.md#postapiauthacceptinvite) | **Post** /api/auth/accept-invite | Accept a workspace invitation
+*AuthAPI* | [**PostApiAuthLogin**](docs/AuthAPI.md#postapiauthlogin) | **Post** /api/auth/login | Sign in with email and password
+*AuthAPI* | [**PostApiAuthLogout**](docs/AuthAPI.md#postapiauthlogout) | **Post** /api/auth/logout | Revoke refresh token
+*AuthAPI* | [**PostApiAuthNewWorkspace**](docs/AuthAPI.md#postapiauthnewworkspace) | **Post** /api/auth/new-workspace | Create a new workspace for an account that belongs to none
+*AuthAPI* | [**PostApiAuthRefresh**](docs/AuthAPI.md#postapiauthrefresh) | **Post** /api/auth/refresh | Rotate refresh token and issue new access JWT
+*AuthAPI* | [**PostApiAuthSignup**](docs/AuthAPI.md#postapiauthsignup) | **Post** /api/auth/signup | Create account and workspace
+*AuthAPI* | [**PostApiAuthSwitchWorkspace**](docs/AuthAPI.md#postapiauthswitchworkspace) | **Post** /api/auth/switch-workspace | Switch active workspace
+*BillingAPI* | [**GetApiBilling**](docs/BillingAPI.md#getapibilling) | **Get** /api/billing | Get the billing account, its plan and usage
+*BillingAPI* | [**PostApiBillingActionsChangePlan**](docs/BillingAPI.md#postapibillingactionschangeplan) | **Post** /api/billing/actions/change-plan | Leave Ultra On-Demand for the Free plan (the whole account)
+*BillingAPI* | [**PostApiBillingCheckoutSession**](docs/BillingAPI.md#postapibillingcheckoutsession) | **Post** /api/billing/checkout-session | Create Stripe Checkout session for a paid plan (the whole account)
+*BillingAPI* | [**PostApiBillingConfirmCheckout**](docs/BillingAPI.md#postapibillingconfirmcheckout) | **Post** /api/billing/confirm-checkout | Confirm checkout session and sync the account plan
+*BillingAPI* | [**PostApiBillingPortalSession**](docs/BillingAPI.md#postapibillingportalsession) | **Post** /api/billing/portal-session | Create Stripe Customer Portal session (the account subscription)
+*BillingAPI* | [**PostApiBillingWebhook**](docs/BillingAPI.md#postapibillingwebhook) | **Post** /api/billing/webhook | Stripe webhook
+*ChartsAPI* | [**DeleteApiChartsByChartId**](docs/ChartsAPI.md#deleteapichartsbychartid) | **Delete** /api/charts/{chartId} | Delete chart permanently
+*ChartsAPI* | [**DeleteApiChartsByChartIdCategoriesByCategoryId**](docs/ChartsAPI.md#deleteapichartsbychartidcategoriesbycategoryid) | **Delete** /api/charts/{chartId}/categories/{categoryId} | Delete a category from the chart draft
+*ChartsAPI* | [**DeleteApiChartsByChartIdPreviewLink**](docs/ChartsAPI.md#deleteapichartsbychartidpreviewlink) | **Delete** /api/charts/{chartId}/preview-link | Revoke every public preview link of a chart
+*ChartsAPI* | [**GetApiCharts**](docs/ChartsAPI.md#getapicharts) | **Get** /api/charts | List charts
+*ChartsAPI* | [**GetApiChartsByChartId**](docs/ChartsAPI.md#getapichartsbychartid) | **Get** /api/charts/{chartId} | Retrieve one chart
+*ChartsAPI* | [**GetApiChartsByChartIdCategories**](docs/ChartsAPI.md#getapichartsbychartidcategories) | **Get** /api/charts/{chartId}/categories | List the categories of a chart
+*ChartsAPI* | [**GetApiChartsByChartIdMap**](docs/ChartsAPI.md#getapichartsbychartidmap) | **Get** /api/charts/{chartId}/map | Read one version of a chart map
+*ChartsAPI* | [**GetApiChartsByChartIdMapDraft**](docs/ChartsAPI.md#getapichartsbychartidmapdraft) | **Get** /api/charts/{chartId}/map/draft | Load chart map draft for designer
+*ChartsAPI* | [**GetApiChartsByChartIdReportsByCategoryCsv**](docs/ChartsAPI.md#getapichartsbychartidreportsbycategorycsv) | **Get** /api/charts/{chartId}/reports/by-category.csv | Chart report by category (CSV)
+*ChartsAPI* | [**GetApiChartsByChartIdReportsByCategoryJson**](docs/ChartsAPI.md#getapichartsbychartidreportsbycategoryjson) | **Get** /api/charts/{chartId}/reports/by-category.json | Chart report by category
+*ChartsAPI* | [**GetApiChartsByChartIdReportsByCategoryKeyCsv**](docs/ChartsAPI.md#getapichartsbychartidreportsbycategorykeycsv) | **Get** /api/charts/{chartId}/reports/by-category-key.csv | Chart report by category key (CSV)
+*ChartsAPI* | [**GetApiChartsByChartIdReportsByCategoryKeyJson**](docs/ChartsAPI.md#getapichartsbychartidreportsbycategorykeyjson) | **Get** /api/charts/{chartId}/reports/by-category-key.json | Chart report by category key
+*ChartsAPI* | [**GetApiChartsByChartIdReportsByCategoryLabelCsv**](docs/ChartsAPI.md#getapichartsbychartidreportsbycategorylabelcsv) | **Get** /api/charts/{chartId}/reports/by-category-label.csv | Chart report by category label (CSV)
+*ChartsAPI* | [**GetApiChartsByChartIdReportsByCategoryLabelJson**](docs/ChartsAPI.md#getapichartsbychartidreportsbycategorylabeljson) | **Get** /api/charts/{chartId}/reports/by-category-label.json | Chart report by category label
+*ChartsAPI* | [**GetApiChartsByChartIdReportsByLabelCsv**](docs/ChartsAPI.md#getapichartsbychartidreportsbylabelcsv) | **Get** /api/charts/{chartId}/reports/by-label.csv | Chart report by label (CSV)
+*ChartsAPI* | [**GetApiChartsByChartIdReportsByLabelJson**](docs/ChartsAPI.md#getapichartsbychartidreportsbylabeljson) | **Get** /api/charts/{chartId}/reports/by-label.json | Chart report by label
+*ChartsAPI* | [**GetApiChartsByChartIdReportsByObjectTypeCsv**](docs/ChartsAPI.md#getapichartsbychartidreportsbyobjecttypecsv) | **Get** /api/charts/{chartId}/reports/by-object-type.csv | Chart report by object type (CSV)
+*ChartsAPI* | [**GetApiChartsByChartIdReportsByObjectTypeJson**](docs/ChartsAPI.md#getapichartsbychartidreportsbyobjecttypejson) | **Get** /api/charts/{chartId}/reports/by-object-type.json | Chart report by object type
+*ChartsAPI* | [**GetApiChartsByChartIdReportsBySectionCsv**](docs/ChartsAPI.md#getapichartsbychartidreportsbysectioncsv) | **Get** /api/charts/{chartId}/reports/by-section.csv | Chart report by section (CSV)
+*ChartsAPI* | [**GetApiChartsByChartIdReportsBySectionJson**](docs/ChartsAPI.md#getapichartsbychartidreportsbysectionjson) | **Get** /api/charts/{chartId}/reports/by-section.json | Chart report by section
+*ChartsAPI* | [**GetApiChartsByChartIdReportsByZoneCsv**](docs/ChartsAPI.md#getapichartsbychartidreportsbyzonecsv) | **Get** /api/charts/{chartId}/reports/by-zone.csv | Chart report by zone (CSV)
+*ChartsAPI* | [**GetApiChartsByChartIdReportsByZoneJson**](docs/ChartsAPI.md#getapichartsbychartidreportsbyzonejson) | **Get** /api/charts/{chartId}/reports/by-zone.json | Chart report by zone
+*ChartsAPI* | [**GetApiChartsByChartIdReportsSummaryByCategoryCsv**](docs/ChartsAPI.md#getapichartsbychartidreportssummarybycategorycsv) | **Get** /api/charts/{chartId}/reports/summary/by-category.csv | Chart summary by category (CSV)
+*ChartsAPI* | [**GetApiChartsByChartIdReportsSummaryByCategoryJson**](docs/ChartsAPI.md#getapichartsbychartidreportssummarybycategoryjson) | **Get** /api/charts/{chartId}/reports/summary/by-category.json | Chart summary by category
+*ChartsAPI* | [**GetApiChartsByChartIdReportsSummaryByCategoryKeyCsv**](docs/ChartsAPI.md#getapichartsbychartidreportssummarybycategorykeycsv) | **Get** /api/charts/{chartId}/reports/summary/by-category-key.csv | Chart summary by category key (CSV)
+*ChartsAPI* | [**GetApiChartsByChartIdReportsSummaryByCategoryKeyJson**](docs/ChartsAPI.md#getapichartsbychartidreportssummarybycategorykeyjson) | **Get** /api/charts/{chartId}/reports/summary/by-category-key.json | Chart summary by category key
+*ChartsAPI* | [**GetApiChartsByChartIdReportsSummaryByCategoryLabelCsv**](docs/ChartsAPI.md#getapichartsbychartidreportssummarybycategorylabelcsv) | **Get** /api/charts/{chartId}/reports/summary/by-category-label.csv | Chart summary by category label (CSV)
+*ChartsAPI* | [**GetApiChartsByChartIdReportsSummaryByCategoryLabelJson**](docs/ChartsAPI.md#getapichartsbychartidreportssummarybycategorylabeljson) | **Get** /api/charts/{chartId}/reports/summary/by-category-label.json | Chart summary by category label
+*ChartsAPI* | [**GetApiChartsByChartIdReportsSummaryByObjectTypeCsv**](docs/ChartsAPI.md#getapichartsbychartidreportssummarybyobjecttypecsv) | **Get** /api/charts/{chartId}/reports/summary/by-object-type.csv | Chart summary by object type (CSV)
+*ChartsAPI* | [**GetApiChartsByChartIdReportsSummaryByObjectTypeJson**](docs/ChartsAPI.md#getapichartsbychartidreportssummarybyobjecttypejson) | **Get** /api/charts/{chartId}/reports/summary/by-object-type.json | Chart summary by object type
+*ChartsAPI* | [**GetApiChartsByChartIdReportsSummaryBySectionCsv**](docs/ChartsAPI.md#getapichartsbychartidreportssummarybysectioncsv) | **Get** /api/charts/{chartId}/reports/summary/by-section.csv | Chart summary by section (CSV)
+*ChartsAPI* | [**GetApiChartsByChartIdReportsSummaryBySectionJson**](docs/ChartsAPI.md#getapichartsbychartidreportssummarybysectionjson) | **Get** /api/charts/{chartId}/reports/summary/by-section.json | Chart summary by section
+*ChartsAPI* | [**GetApiChartsByChartIdReportsSummaryByZoneCsv**](docs/ChartsAPI.md#getapichartsbychartidreportssummarybyzonecsv) | **Get** /api/charts/{chartId}/reports/summary/by-zone.csv | Chart summary by zone (CSV)
+*ChartsAPI* | [**GetApiChartsByChartIdReportsSummaryByZoneJson**](docs/ChartsAPI.md#getapichartsbychartidreportssummarybyzonejson) | **Get** /api/charts/{chartId}/reports/summary/by-zone.json | Chart summary by zone
+*ChartsAPI* | [**GetApiChartsByChartIdThumbnail**](docs/ChartsAPI.md#getapichartsbychartidthumbnail) | **Get** /api/charts/{chartId}/thumbnail | Chart thumbnail
+*ChartsAPI* | [**GetApiChartsByChartIdVersions**](docs/ChartsAPI.md#getapichartsbychartidversions) | **Get** /api/charts/{chartId}/versions | List published versions
+*ChartsAPI* | [**GetApiChartsByChartIdZones**](docs/ChartsAPI.md#getapichartsbychartidzones) | **Get** /api/charts/{chartId}/zones | List the zones of a chart
+*ChartsAPI* | [**GetApiChartsTags**](docs/ChartsAPI.md#getapichartstags) | **Get** /api/charts/tags | List chart tags
+*ChartsAPI* | [**PatchApiChartsByChartId**](docs/ChartsAPI.md#patchapichartsbychartid) | **Patch** /api/charts/{chartId} | Update chart name or key
+*ChartsAPI* | [**PatchApiChartsByChartIdCategoriesByCategoryId**](docs/ChartsAPI.md#patchapichartsbychartidcategoriesbycategoryid) | **Patch** /api/charts/{chartId}/categories/{categoryId} | Update a category in the chart draft
+*ChartsAPI* | [**PostApiCharts**](docs/ChartsAPI.md#postapicharts) | **Post** /api/charts | Create chart
+*ChartsAPI* | [**PostApiChartsByChartIdActionsArchive**](docs/ChartsAPI.md#postapichartsbychartidactionsarchive) | **Post** /api/charts/{chartId}/actions/archive | Archive chart
+*ChartsAPI* | [**PostApiChartsByChartIdActionsCopyToWorkspace**](docs/ChartsAPI.md#postapichartsbychartidactionscopytoworkspace) | **Post** /api/charts/{chartId}/actions/copy-to-workspace | Copy a chart to another workspace
+*ChartsAPI* | [**PostApiChartsByChartIdActionsScanChart**](docs/ChartsAPI.md#postapichartsbychartidactionsscanchart) | **Post** /api/charts/{chartId}/actions/scan-chart | Retired: scan a chart image (410)
+*ChartsAPI* | [**PostApiChartsByChartIdActionsUnarchive**](docs/ChartsAPI.md#postapichartsbychartidactionsunarchive) | **Post** /api/charts/{chartId}/actions/unarchive | Unarchive chart
+*ChartsAPI* | [**PostApiChartsByChartIdActionsValidate**](docs/ChartsAPI.md#postapichartsbychartidactionsvalidate) | **Post** /api/charts/{chartId}/actions/validate | Validate a chart map (dry run)
+*ChartsAPI* | [**PostApiChartsByChartIdCategories**](docs/ChartsAPI.md#postapichartsbychartidcategories) | **Post** /api/charts/{chartId}/categories | Add a category to the chart draft
+*ChartsAPI* | [**PostApiChartsByChartIdDuplicate**](docs/ChartsAPI.md#postapichartsbychartidduplicate) | **Post** /api/charts/{chartId}/duplicate | Duplicate chart
+*ChartsAPI* | [**PostApiChartsByChartIdMapDraftActionsDiscard**](docs/ChartsAPI.md#postapichartsbychartidmapdraftactionsdiscard) | **Post** /api/charts/{chartId}/map/draft/actions/discard | Discard chart draft
+*ChartsAPI* | [**PostApiChartsByChartIdMapPublish**](docs/ChartsAPI.md#postapichartsbychartidmappublish) | **Post** /api/charts/{chartId}/map/publish | Publish chart map template
+*ChartsAPI* | [**PostApiChartsByChartIdPreviewLink**](docs/ChartsAPI.md#postapichartsbychartidpreviewlink) | **Post** /api/charts/{chartId}/preview-link | Create a public preview link
+*ChartsAPI* | [**PostApiChartsByChartIdVersionsByVersionActionsCopy**](docs/ChartsAPI.md#postapichartsbychartidversionsbyversionactionscopy) | **Post** /api/charts/{chartId}/versions/{version}/actions/copy | Copy a chart version into a new chart
+*ChartsAPI* | [**PostApiChartsByChartIdVersionsByVersionActionsRestoreToDraft**](docs/ChartsAPI.md#postapichartsbychartidversionsbyversionactionsrestoretodraft) | **Post** /api/charts/{chartId}/versions/{version}/actions/restore-to-draft | Restore a version into the draft
+*ChartsAPI* | [**PostApiEventsByEventIdActionsScanChart**](docs/ChartsAPI.md#postapieventsbyeventidactionsscanchart) | **Post** /api/events/{eventId}/actions/scan-chart | Retired: scan an event chart image (410)
+*ChartsAPI* | [**PutApiChartsByChartIdMapDraft**](docs/ChartsAPI.md#putapichartsbychartidmapdraft) | **Put** /api/charts/{chartId}/map/draft | Save chart map draft
+*ChartsAPI* | [**PutApiChartsByChartIdTags**](docs/ChartsAPI.md#putapichartsbychartidtags) | **Put** /api/charts/{chartId}/tags | Replace chart tags
+*ChartsAPI* | [**PutApiChartsByChartIdVersionsByVersionThumbnail**](docs/ChartsAPI.md#putapichartsbychartidversionsbyversionthumbnail) | **Put** /api/charts/{chartId}/versions/{version}/thumbnail | Attach a rendered thumbnail to a version
+*EmbedAPI* | [**GetApiTicketBuyers**](docs/EmbedAPI.md#getapiticketbuyers) | **Get** /api/ticket-buyers | List registered ticket buyer ids
+*EmbedAPI* | [**PostApiEmbedTokens**](docs/EmbedAPI.md#postapiembedtokens) | **Post** /api/embed-tokens | Mint a short-lived designer/manager embed token
+*EmbedAPI* | [**PostApiTicketBuyers**](docs/EmbedAPI.md#postapiticketbuyers) | **Post** /api/ticket-buyers | Register ticket buyer ids
+*EmbedAPI* | [**PostApiTicketBuyersActionsRemove**](docs/EmbedAPI.md#postapiticketbuyersactionsremove) | **Post** /api/ticket-buyers/actions/remove | Remove ticket buyer ids
+*EmbedAPI* | [**PostApiViewerTokens**](docs/EmbedAPI.md#postapiviewertokens) | **Post** /api/viewer-tokens | Mint a short-lived buyer (viewer) token with the partner API key
+*EmbedOriginsAPI* | [**DeleteApiEmbedOriginsById**](docs/EmbedOriginsAPI.md#deleteapiembedoriginsbyid) | **Delete** /api/embed-origins/{id} | Remove an embed origin
+*EmbedOriginsAPI* | [**GetApiEmbedOrigins**](docs/EmbedOriginsAPI.md#getapiembedorigins) | **Get** /api/embed-origins | List allowed embed origins for the workspace
+*EmbedOriginsAPI* | [**GetApiEmbedTokensFramePolicy**](docs/EmbedOriginsAPI.md#getapiembedtokensframepolicy) | **Get** /api/embed-tokens/frame-policy | Resolve the embed origins of an embed token
+*EmbedOriginsAPI* | [**GetApiEventsByEventIdEmbedPolicy**](docs/EmbedOriginsAPI.md#getapieventsbyeventidembedpolicy) | **Get** /api/events/{eventId}/embed-policy | Resolve tenant embed origins for an event
+*EmbedOriginsAPI* | [**GetApiSeasonsBySeasonIdEmbedPolicy**](docs/EmbedOriginsAPI.md#getapiseasonsbyseasonidembedpolicy) | **Get** /api/seasons/{seasonId}/embed-policy | Resolve tenant embed origins for a season
+*EmbedOriginsAPI* | [**PostApiEmbedOrigins**](docs/EmbedOriginsAPI.md#postapiembedorigins) | **Post** /api/embed-origins | Register an allowed embed origin
+*EventLogAPI* | [**GetApiEventLog**](docs/EventLogAPI.md#getapieventlog) | **Get** /api/event-log | Event log: admin changes of charts and events (cursor-paginated)
+*EventsAPI* | [**DeleteApiEventsByEventId**](docs/EventsAPI.md#deleteapieventsbyeventid) | **Delete** /api/events/{eventId} | Delete event
+*EventsAPI* | [**DeleteApiEventsByEventIdInventoryChannelsByChannelKeyId**](docs/EventsAPI.md#deleteapieventsbyeventidinventorychannelsbychannelkeyid) | **Delete** /api/events/{eventId}/inventory/channels/{channelKeyId} | Delete inventory channel
+*EventsAPI* | [**GetApiEvents**](docs/EventsAPI.md#getapievents) | **Get** /api/events | List events for the authenticated tenant
+*EventsAPI* | [**GetApiEventsByEventId**](docs/EventsAPI.md#getapieventsbyeventid) | **Get** /api/events/{eventId} | Retrieve one event
+*EventsAPI* | [**GetApiEventsByEventIdChannelMembership**](docs/EventsAPI.md#getapieventsbyeventidchannelmembership) | **Get** /api/events/{eventId}/channel-membership | Do objects belong to my inventory channel? (renderer isObjectInChannel)
+*EventsAPI* | [**GetApiEventsByEventIdChannelObjects**](docs/EventsAPI.md#getapieventsbyeventidchannelobjects) | **Get** /api/events/{eventId}/channel-objects | Objects of my inventory channels (renderer channel-only selection)
+*EventsAPI* | [**GetApiEventsByEventIdGeometryByHash**](docs/EventsAPI.md#getapieventsbyeventidgeometrybyhash) | **Get** /api/events/{eventId}/geometry/{hash} | Published geometry (content-addressed)
+*EventsAPI* | [**GetApiEventsByEventIdInventoryChannels**](docs/EventsAPI.md#getapieventsbyeventidinventorychannels) | **Get** /api/events/{eventId}/inventory/channels | List inventory channels (ops)
+*EventsAPI* | [**GetApiEventsByEventIdManifest**](docs/EventsAPI.md#getapieventsbyeventidmanifest) | **Get** /api/events/{eventId}/manifest | Published geometry manifest
+*EventsAPI* | [**GetApiEventsByEventIdMapDraft**](docs/EventsAPI.md#getapieventsbyeventidmapdraft) | **Get** /api/events/{eventId}/map/draft | Load map draft for designer
+*EventsAPI* | [**GetApiEventsByEventIdMapVersions**](docs/EventsAPI.md#getapieventsbyeventidmapversions) | **Get** /api/events/{eventId}/map/versions | List event map versions
+*EventsAPI* | [**GetApiEventsByEventIdMapVersionsByVersionThumbnail**](docs/EventsAPI.md#getapieventsbyeventidmapversionsbyversionthumbnail) | **Get** /api/events/{eventId}/map/versions/{version}/thumbnail | Event map version preview
+*EventsAPI* | [**GetApiEventsByEventIdObjects**](docs/EventsAPI.md#getapieventsbyeventidobjects) | **Get** /api/events/{eventId}/objects | List the objects of a ticket buyer
+*EventsAPI* | [**GetApiEventsByEventIdObjectsByObjectId**](docs/EventsAPI.md#getapieventsbyeventidobjectsbyobjectid) | **Get** /api/events/{eventId}/objects/{objectId} | Retrieve one object (seat or GA area)
+*EventsAPI* | [**GetApiEventsByEventIdObjectsByObjectIdStatusChanges**](docs/EventsAPI.md#getapieventsbyeventidobjectsbyobjectidstatuschanges) | **Get** /api/events/{eventId}/objects/{objectId}/status-changes | List status changes of one object
+*EventsAPI* | [**GetApiEventsByEventIdPricing**](docs/EventsAPI.md#getapieventsbyeventidpricing) | **Get** /api/events/{eventId}/pricing | Read the synced price table of an event
+*EventsAPI* | [**GetApiEventsByEventIdReportsByAvailabilityCsv**](docs/EventsAPI.md#getapieventsbyeventidreportsbyavailabilitycsv) | **Get** /api/events/{eventId}/reports/by-availability.csv | Detailed report grouped by availability (available / not_available) (CSV)
+*EventsAPI* | [**GetApiEventsByEventIdReportsByAvailabilityJson**](docs/EventsAPI.md#getapieventsbyeventidreportsbyavailabilityjson) | **Get** /api/events/{eventId}/reports/by-availability.json | Detailed report grouped by availability (available / not_available)
+*EventsAPI* | [**GetApiEventsByEventIdReportsByAvailabilityReasonCsv**](docs/EventsAPI.md#getapieventsbyeventidreportsbyavailabilityreasoncsv) | **Get** /api/events/{eventId}/reports/by-availability-reason.csv | Detailed report grouped by availability reason (CSV)
+*EventsAPI* | [**GetApiEventsByEventIdReportsByAvailabilityReasonJson**](docs/EventsAPI.md#getapieventsbyeventidreportsbyavailabilityreasonjson) | **Get** /api/events/{eventId}/reports/by-availability-reason.json | Detailed report grouped by availability reason
+*EventsAPI* | [**GetApiEventsByEventIdReportsByCategoryJson**](docs/EventsAPI.md#getapieventsbyeventidreportsbycategoryjson) | **Get** /api/events/{eventId}/reports/by-category.json | Seat and GA counts by category
+*EventsAPI* | [**GetApiEventsByEventIdReportsByCategoryKeyCsv**](docs/EventsAPI.md#getapieventsbyeventidreportsbycategorykeycsv) | **Get** /api/events/{eventId}/reports/by-category-key.csv | Detailed report grouped by category key (CSV)
+*EventsAPI* | [**GetApiEventsByEventIdReportsByCategoryKeyJson**](docs/EventsAPI.md#getapieventsbyeventidreportsbycategorykeyjson) | **Get** /api/events/{eventId}/reports/by-category-key.json | Detailed report grouped by category key
+*EventsAPI* | [**GetApiEventsByEventIdReportsByCategoryLabelCsv**](docs/EventsAPI.md#getapieventsbyeventidreportsbycategorylabelcsv) | **Get** /api/events/{eventId}/reports/by-category-label.csv | Detailed report grouped by category label (CSV)
+*EventsAPI* | [**GetApiEventsByEventIdReportsByCategoryLabelJson**](docs/EventsAPI.md#getapieventsbyeventidreportsbycategorylabeljson) | **Get** /api/events/{eventId}/reports/by-category-label.json | Detailed report grouped by category label
+*EventsAPI* | [**GetApiEventsByEventIdReportsByChannelJson**](docs/EventsAPI.md#getapieventsbyeventidreportsbychanneljson) | **Get** /api/events/{eventId}/reports/by-channel.json | Detailed report grouped by inventory channel
+*EventsAPI* | [**GetApiEventsByEventIdReportsByLabelJson**](docs/EventsAPI.md#getapieventsbyeventidreportsbylabeljson) | **Get** /api/events/{eventId}/reports/by-label.json | Detailed report grouped by object label (Postgres)
+*EventsAPI* | [**GetApiEventsByEventIdReportsByObjectStatusCsv**](docs/EventsAPI.md#getapieventsbyeventidreportsbyobjectstatuscsv) | **Get** /api/events/{eventId}/reports/by-object-status.csv | Detailed report grouped by object status (CSV)
+*EventsAPI* | [**GetApiEventsByEventIdReportsByObjectStatusJson**](docs/EventsAPI.md#getapieventsbyeventidreportsbyobjectstatusjson) | **Get** /api/events/{eventId}/reports/by-object-status.json | Detailed report grouped by object status
+*EventsAPI* | [**GetApiEventsByEventIdReportsByObjectTypeJson**](docs/EventsAPI.md#getapieventsbyeventidreportsbyobjecttypejson) | **Get** /api/events/{eventId}/reports/by-object-type.json | Detailed report grouped by object type (seat|ga)
+*EventsAPI* | [**GetApiEventsByEventIdReportsByOrderIdJson**](docs/EventsAPI.md#getapieventsbyeventidreportsbyorderidjson) | **Get** /api/events/{eventId}/reports/by-order-id.json | Detailed report grouped by orderId (Postgres)
+*EventsAPI* | [**GetApiEventsByEventIdReportsBySectionJson**](docs/EventsAPI.md#getapieventsbyeventidreportsbysectionjson) | **Get** /api/events/{eventId}/reports/by-section.json | Detailed report grouped by section
+*EventsAPI* | [**GetApiEventsByEventIdReportsByStatusJson**](docs/EventsAPI.md#getapieventsbyeventidreportsbystatusjson) | **Get** /api/events/{eventId}/reports/by-status.json | Seat counts by Postgres status
+*EventsAPI* | [**GetApiEventsByEventIdReportsByZoneCsv**](docs/EventsAPI.md#getapieventsbyeventidreportsbyzonecsv) | **Get** /api/events/{eventId}/reports/by-zone.csv | Detailed report grouped by zone (CSV)
+*EventsAPI* | [**GetApiEventsByEventIdReportsByZoneJson**](docs/EventsAPI.md#getapieventsbyeventidreportsbyzonejson) | **Get** /api/events/{eventId}/reports/by-zone.json | Detailed report grouped by zone
+*EventsAPI* | [**GetApiEventsByEventIdReportsDeepSummaryByAvailabilityJson**](docs/EventsAPI.md#getapieventsbyeventidreportsdeepsummarybyavailabilityjson) | **Get** /api/events/{eventId}/reports/deep-summary/by-availability.json | Deep summary report by availability
+*EventsAPI* | [**GetApiEventsByEventIdReportsDeepSummaryByAvailabilityReasonJson**](docs/EventsAPI.md#getapieventsbyeventidreportsdeepsummarybyavailabilityreasonjson) | **Get** /api/events/{eventId}/reports/deep-summary/by-availability-reason.json | Deep summary report by availability reason
+*EventsAPI* | [**GetApiEventsByEventIdReportsDeepSummaryByCategoryJson**](docs/EventsAPI.md#getapieventsbyeventidreportsdeepsummarybycategoryjson) | **Get** /api/events/{eventId}/reports/deep-summary/by-category.json | Deep summary report by category
+*EventsAPI* | [**GetApiEventsByEventIdReportsDeepSummaryByCategoryKeyJson**](docs/EventsAPI.md#getapieventsbyeventidreportsdeepsummarybycategorykeyjson) | **Get** /api/events/{eventId}/reports/deep-summary/by-category-key.json | Deep summary report by category key
+*EventsAPI* | [**GetApiEventsByEventIdReportsDeepSummaryByCategoryLabelJson**](docs/EventsAPI.md#getapieventsbyeventidreportsdeepsummarybycategorylabeljson) | **Get** /api/events/{eventId}/reports/deep-summary/by-category-label.json | Deep summary report by category label
+*EventsAPI* | [**GetApiEventsByEventIdReportsDeepSummaryByChannelJson**](docs/EventsAPI.md#getapieventsbyeventidreportsdeepsummarybychanneljson) | **Get** /api/events/{eventId}/reports/deep-summary/by-channel.json | Deep summary report by channel
+*EventsAPI* | [**GetApiEventsByEventIdReportsDeepSummaryByObjectTypeJson**](docs/EventsAPI.md#getapieventsbyeventidreportsdeepsummarybyobjecttypejson) | **Get** /api/events/{eventId}/reports/deep-summary/by-object-type.json | Deep summary report by object type
+*EventsAPI* | [**GetApiEventsByEventIdReportsDeepSummaryBySectionJson**](docs/EventsAPI.md#getapieventsbyeventidreportsdeepsummarybysectionjson) | **Get** /api/events/{eventId}/reports/deep-summary/by-section.json | Deep summary report by section
+*EventsAPI* | [**GetApiEventsByEventIdReportsDeepSummaryByStatusJson**](docs/EventsAPI.md#getapieventsbyeventidreportsdeepsummarybystatusjson) | **Get** /api/events/{eventId}/reports/deep-summary/by-status.json | Deep summary report by status
+*EventsAPI* | [**GetApiEventsByEventIdReportsDeepSummaryByZoneJson**](docs/EventsAPI.md#getapieventsbyeventidreportsdeepsummarybyzonejson) | **Get** /api/events/{eventId}/reports/deep-summary/by-zone.json | Deep summary report by zone
+*EventsAPI* | [**GetApiEventsByEventIdReportsDeepSummaryJson**](docs/EventsAPI.md#getapieventsbyeventidreportsdeepsummaryjson) | **Get** /api/events/{eventId}/reports/deep-summary.json | Deep summary: status counts nested by category
+*EventsAPI* | [**GetApiEventsByEventIdReportsOccupancyCsv**](docs/EventsAPI.md#getapieventsbyeventidreportsoccupancycsv) | **Get** /api/events/{eventId}/reports/occupancy.csv | Export seat and GA occupancy as CSV
+*EventsAPI* | [**GetApiEventsByEventIdReportsSalesCsv**](docs/EventsAPI.md#getapieventsbyeventidreportssalescsv) | **Get** /api/events/{eventId}/reports/sales.csv | Export confirmed seat and GA sales as CSV
+*EventsAPI* | [**GetApiEventsByEventIdReportsSummaryByAvailabilityCsv**](docs/EventsAPI.md#getapieventsbyeventidreportssummarybyavailabilitycsv) | **Get** /api/events/{eventId}/reports/summary/by-availability.csv | Summary report by availability (CSV)
+*EventsAPI* | [**GetApiEventsByEventIdReportsSummaryByAvailabilityJson**](docs/EventsAPI.md#getapieventsbyeventidreportssummarybyavailabilityjson) | **Get** /api/events/{eventId}/reports/summary/by-availability.json | Summary report by availability
+*EventsAPI* | [**GetApiEventsByEventIdReportsSummaryByAvailabilityReasonCsv**](docs/EventsAPI.md#getapieventsbyeventidreportssummarybyavailabilityreasoncsv) | **Get** /api/events/{eventId}/reports/summary/by-availability-reason.csv | Summary report by availability reason (CSV)
+*EventsAPI* | [**GetApiEventsByEventIdReportsSummaryByAvailabilityReasonJson**](docs/EventsAPI.md#getapieventsbyeventidreportssummarybyavailabilityreasonjson) | **Get** /api/events/{eventId}/reports/summary/by-availability-reason.json | Summary report by availability reason
+*EventsAPI* | [**GetApiEventsByEventIdReportsSummaryByCategoryCsv**](docs/EventsAPI.md#getapieventsbyeventidreportssummarybycategorycsv) | **Get** /api/events/{eventId}/reports/summary/by-category.csv | Summary report by category (CSV)
+*EventsAPI* | [**GetApiEventsByEventIdReportsSummaryByCategoryJson**](docs/EventsAPI.md#getapieventsbyeventidreportssummarybycategoryjson) | **Get** /api/events/{eventId}/reports/summary/by-category.json | Summary report by category
+*EventsAPI* | [**GetApiEventsByEventIdReportsSummaryByCategoryKeyCsv**](docs/EventsAPI.md#getapieventsbyeventidreportssummarybycategorykeycsv) | **Get** /api/events/{eventId}/reports/summary/by-category-key.csv | Summary report by category key (CSV)
+*EventsAPI* | [**GetApiEventsByEventIdReportsSummaryByCategoryKeyJson**](docs/EventsAPI.md#getapieventsbyeventidreportssummarybycategorykeyjson) | **Get** /api/events/{eventId}/reports/summary/by-category-key.json | Summary report by category key
+*EventsAPI* | [**GetApiEventsByEventIdReportsSummaryByCategoryLabelCsv**](docs/EventsAPI.md#getapieventsbyeventidreportssummarybycategorylabelcsv) | **Get** /api/events/{eventId}/reports/summary/by-category-label.csv | Summary report by category label (CSV)
+*EventsAPI* | [**GetApiEventsByEventIdReportsSummaryByCategoryLabelJson**](docs/EventsAPI.md#getapieventsbyeventidreportssummarybycategorylabeljson) | **Get** /api/events/{eventId}/reports/summary/by-category-label.json | Summary report by category label
+*EventsAPI* | [**GetApiEventsByEventIdReportsSummaryByChannelCsv**](docs/EventsAPI.md#getapieventsbyeventidreportssummarybychannelcsv) | **Get** /api/events/{eventId}/reports/summary/by-channel.csv | Summary report by channel (CSV)
+*EventsAPI* | [**GetApiEventsByEventIdReportsSummaryByChannelJson**](docs/EventsAPI.md#getapieventsbyeventidreportssummarybychanneljson) | **Get** /api/events/{eventId}/reports/summary/by-channel.json | Summary report by channel
+*EventsAPI* | [**GetApiEventsByEventIdReportsSummaryByObjectTypeCsv**](docs/EventsAPI.md#getapieventsbyeventidreportssummarybyobjecttypecsv) | **Get** /api/events/{eventId}/reports/summary/by-object-type.csv | Summary report by object type (CSV)
+*EventsAPI* | [**GetApiEventsByEventIdReportsSummaryByObjectTypeJson**](docs/EventsAPI.md#getapieventsbyeventidreportssummarybyobjecttypejson) | **Get** /api/events/{eventId}/reports/summary/by-object-type.json | Summary report by object type
+*EventsAPI* | [**GetApiEventsByEventIdReportsSummaryBySectionCsv**](docs/EventsAPI.md#getapieventsbyeventidreportssummarybysectioncsv) | **Get** /api/events/{eventId}/reports/summary/by-section.csv | Summary report by section (CSV)
+*EventsAPI* | [**GetApiEventsByEventIdReportsSummaryBySectionJson**](docs/EventsAPI.md#getapieventsbyeventidreportssummarybysectionjson) | **Get** /api/events/{eventId}/reports/summary/by-section.json | Summary report by section
+*EventsAPI* | [**GetApiEventsByEventIdReportsSummaryByStatusCsv**](docs/EventsAPI.md#getapieventsbyeventidreportssummarybystatuscsv) | **Get** /api/events/{eventId}/reports/summary/by-status.csv | Summary report by status (CSV)
+*EventsAPI* | [**GetApiEventsByEventIdReportsSummaryByStatusJson**](docs/EventsAPI.md#getapieventsbyeventidreportssummarybystatusjson) | **Get** /api/events/{eventId}/reports/summary/by-status.json | Summary report by status
+*EventsAPI* | [**GetApiEventsByEventIdReportsSummaryByZoneCsv**](docs/EventsAPI.md#getapieventsbyeventidreportssummarybyzonecsv) | **Get** /api/events/{eventId}/reports/summary/by-zone.csv | Summary report by zone (CSV)
+*EventsAPI* | [**GetApiEventsByEventIdReportsSummaryByZoneJson**](docs/EventsAPI.md#getapieventsbyeventidreportssummarybyzonejson) | **Get** /api/events/{eventId}/reports/summary/by-zone.json | Summary report by zone
+*EventsAPI* | [**GetApiEventsByEventIdReportsSummaryJson**](docs/EventsAPI.md#getapieventsbyeventidreportssummaryjson) | **Get** /api/events/{eventId}/reports/summary.json | Occupancy summary JSON (Postgres only)
+*EventsAPI* | [**GetApiEventsByEventIdSalesCounters**](docs/EventsAPI.md#getapieventsbyeventidsalescounters) | **Get** /api/events/{eventId}/sales-counters | Live sales counters (quotas, lots) of an event
+*EventsAPI* | [**GetApiEventsByEventIdSalesRules**](docs/EventsAPI.md#getapieventsbyeventidsalesrules) | **Get** /api/events/{eventId}/sales-rules | Read the sales rules of an event
+*EventsAPI* | [**GetApiEventsByEventIdSeatViews**](docs/EventsAPI.md#getapieventsbyeventidseatviews) | **Get** /api/events/{eventId}/seat-views | List view-from-seat image and optional 360 URLs
+*EventsAPI* | [**GetApiEventsByEventIdSeats**](docs/EventsAPI.md#getapieventsbyeventidseats) | **Get** /api/events/{eventId}/seats | List seats for an event
+*EventsAPI* | [**GetApiEventsByEventIdState**](docs/EventsAPI.md#getapieventsbyeventidstate) | **Get** /api/events/{eventId}/state | Compact visual state (protocol 5)
+*EventsAPI* | [**GetApiEventsByEventIdStatusChanges**](docs/EventsAPI.md#getapieventsbyeventidstatuschanges) | **Get** /api/events/{eventId}/status-changes | List status changes of an event
+*EventsAPI* | [**GetApiEventsByEventIdZones**](docs/EventsAPI.md#getapieventsbyeventidzones) | **Get** /api/events/{eventId}/zones | List the zones of an event
+*EventsAPI* | [**PatchApiEventsByEventId**](docs/EventsAPI.md#patchapieventsbyeventid) | **Patch** /api/events/{eventId} | Patch event: name, date, currency, overrides (isInThePast is irreversible)
+*EventsAPI* | [**PatchApiEventsByEventIdInventoryChannelsByChannelKeyId**](docs/EventsAPI.md#patchapieventsbyeventidinventorychannelsbychannelkeyid) | **Patch** /api/events/{eventId}/inventory/channels/{channelKeyId} | Rename or recolor an inventory channel
+*EventsAPI* | [**PostApiEvents**](docs/EventsAPI.md#postapievents) | **Post** /api/events | Create event
+*EventsAPI* | [**PostApiEventsActionsEditForSaleConfig**](docs/EventsAPI.md#postapieventsactionseditforsaleconfig) | **Post** /api/events/actions/edit-for-sale-config | Edit the for-sale configuration of several events (all or nothing)
+*EventsAPI* | [**PostApiEventsBulk**](docs/EventsAPI.md#postapieventsbulk) | **Post** /api/events/bulk | Create up to 50 events for one chart
+*EventsAPI* | [**PostApiEventsByEventIdActionsEditForSaleConfig**](docs/EventsAPI.md#postapieventsbyeventidactionseditforsaleconfig) | **Post** /api/events/{eventId}/actions/edit-for-sale-config | Edit the for-sale configuration (forSale and notForSale in one transaction)
+*EventsAPI* | [**PostApiEventsByEventIdActionsMarkEverythingAsForSale**](docs/EventsAPI.md#postapieventsbyeventidactionsmarkeverythingasforsale) | **Post** /api/events/{eventId}/actions/mark-everything-as-for-sale | Put every object of the event back on sale
+*EventsAPI* | [**PostApiEventsByEventIdActionsMarkEverythingAsNotForSale**](docs/EventsAPI.md#postapieventsbyeventidactionsmarkeverythingasnotforsale) | **Post** /api/events/{eventId}/actions/mark-everything-as-not-for-sale | Mark every object of the event not for sale
+*EventsAPI* | [**PostApiEventsByEventIdActionsMoveToNewChartCopy**](docs/EventsAPI.md#postapieventsbyeventidactionsmovetonewchartcopy) | **Post** /api/events/{eventId}/actions/move-to-new-chart-copy | Move the event to a new copy of its chart
+*EventsAPI* | [**PostApiEventsByEventIdDuplicate**](docs/EventsAPI.md#postapieventsbyeventidduplicate) | **Post** /api/events/{eventId}/duplicate | Duplicate event
+*EventsAPI* | [**PostApiEventsByEventIdInventoryChannels**](docs/EventsAPI.md#postapieventsbyeventidinventorychannels) | **Post** /api/events/{eventId}/inventory/channels | Create inventory channel
+*EventsAPI* | [**PostApiEventsByEventIdInventoryChannelsAssign**](docs/EventsAPI.md#postapieventsbyeventidinventorychannelsassign) | **Post** /api/events/{eventId}/inventory/channels/assign | Assign seats/GA to inventory channel
+*EventsAPI* | [**PostApiEventsByEventIdInventoryForSaleApply**](docs/EventsAPI.md#postapieventsbyeventidinventoryforsaleapply) | **Post** /api/events/{eventId}/inventory/for-sale/apply | Apply for-sale / not-for-sale to a selection (incremental)
+*EventsAPI* | [**PostApiEventsByEventIdMapDraftActionsDiscard**](docs/EventsAPI.md#postapieventsbyeventidmapdraftactionsdiscard) | **Post** /api/events/{eventId}/map/draft/actions/discard | Discard event map draft
+*EventsAPI* | [**PostApiEventsByEventIdMapPublish**](docs/EventsAPI.md#postapieventsbyeventidmappublish) | **Post** /api/events/{eventId}/map/publish | Publish draft map to live seats
+*EventsAPI* | [**PostApiEventsByEventIdMapVersionsByVersionActionsRestoreToDraft**](docs/EventsAPI.md#postapieventsbyeventidmapversionsbyversionactionsrestoretodraft) | **Post** /api/events/{eventId}/map/versions/{version}/actions/restore-to-draft | Restore an event map version into the draft
+*EventsAPI* | [**PostApiEventsByEventIdObjectsActionsRetrieve**](docs/EventsAPI.md#postapieventsbyeventidobjectsactionsretrieve) | **Post** /api/events/{eventId}/objects/actions/retrieve | Retrieve several objects at once (seats.io retrieveObjectInfos)
+*EventsAPI* | [**PostApiEventsByEventIdSalesCountersActionsRebuild**](docs/EventsAPI.md#postapieventsbyeventidsalescountersactionsrebuild) | **Post** /api/events/{eventId}/sales-counters/actions/rebuild | Rebuild the sold counters of an event from its orders
+*EventsAPI* | [**PutApiEventsByEventIdInventoryChannels**](docs/EventsAPI.md#putapieventsbyeventidinventorychannels) | **Put** /api/events/{eventId}/inventory/channels | Replace all inventory channel assignments atomically
+*EventsAPI* | [**PutApiEventsByEventIdInventoryChannelsDefinitions**](docs/EventsAPI.md#putapieventsbyeventidinventorychannelsdefinitions) | **Put** /api/events/{eventId}/inventory/channels/definitions | Replace all inventory channels (definitions and assignments) atomically
+*EventsAPI* | [**PutApiEventsByEventIdInventoryForSale**](docs/EventsAPI.md#putapieventsbyeventidinventoryforsale) | **Put** /api/events/{eventId}/inventory/for-sale | Replace the whole for-sale configuration atomically
+*EventsAPI* | [**PutApiEventsByEventIdMap**](docs/EventsAPI.md#putapieventsbyeventidmap) | **Put** /api/events/{eventId}/map | Save map draft (legacy path)
+*EventsAPI* | [**PutApiEventsByEventIdMapDraft**](docs/EventsAPI.md#putapieventsbyeventidmapdraft) | **Put** /api/events/{eventId}/map/draft | Save map draft (does not go live)
+*EventsAPI* | [**PutApiEventsByEventIdPricing**](docs/EventsAPI.md#putapieventsbyeventidpricing) | **Put** /api/events/{eventId}/pricing | Push the synced price table of an event (synced catalog mode)
+*EventsAPI* | [**PutApiEventsByEventIdSalesRules**](docs/EventsAPI.md#putapieventsbyeventidsalesrules) | **Put** /api/events/{eventId}/sales-rules | Replace the sales rules of an event (quotas, lots, buyer limit, pricing source)
+*HealthAPI* | [**GetApiHealth**](docs/HealthAPI.md#getapihealth) | **Get** /api/health | Health check
+*HealthAPI* | [**GetApiStatus**](docs/HealthAPI.md#getapistatus) | **Get** /api/status | Public platform status and 90-day uptime
+*HealthAPI* | [**GetHealthLive**](docs/HealthAPI.md#gethealthlive) | **Get** /health/live | Liveness probe
+*HealthAPI* | [**GetInternalMetrics**](docs/HealthAPI.md#getinternalmetrics) | **Get** /internal/metrics | Prometheus metrics
+*HealthAPI* | [**PutInternalStatusNotices**](docs/HealthAPI.md#putinternalstatusnotices) | **Put** /internal/status/notices | Replace status page notices (operators)
+*ListingsAPI* | [**DeleteApiListingTypesByKey**](docs/ListingsAPI.md#deleteapilistingtypesbykey) | **Delete** /api/listing-types/{key} | Delete a listing type
+*ListingsAPI* | [**GetApiEventsByEventIdListings**](docs/ListingsAPI.md#getapieventsbyeventidlistings) | **Get** /api/events/{eventId}/listings | List the listings of an event
+*ListingsAPI* | [**GetApiEventsByEventIdListingsByListingId**](docs/ListingsAPI.md#getapieventsbyeventidlistingsbylistingid) | **Get** /api/events/{eventId}/listings/{listingId} | Read a listing
+*ListingsAPI* | [**GetApiListingTypes**](docs/ListingsAPI.md#getapilistingtypes) | **Get** /api/listing-types | List the listing types of the workspace
+*ListingsAPI* | [**PatchApiEventsByEventIdListingsByListingId**](docs/ListingsAPI.md#patchapieventsbyeventidlistingsbylistingid) | **Patch** /api/events/{eventId}/listings/{listingId} | Update an active listing
+*ListingsAPI* | [**PatchApiListingTypesByKey**](docs/ListingsAPI.md#patchapilistingtypesbykey) | **Patch** /api/listing-types/{key} | Update a listing type
+*ListingsAPI* | [**PostApiEventsByEventIdListings**](docs/ListingsAPI.md#postapieventsbyeventidlistings) | **Post** /api/events/{eventId}/listings | Create a listing
+*ListingsAPI* | [**PostApiEventsByEventIdListingsByListingIdActionsMarkSold**](docs/ListingsAPI.md#postapieventsbyeventidlistingsbylistingidactionsmarksold) | **Post** /api/events/{eventId}/listings/{listingId}/actions/mark-sold | Mark a listing as sold
+*ListingsAPI* | [**PostApiEventsByEventIdListingsByListingIdActionsWithdraw**](docs/ListingsAPI.md#postapieventsbyeventidlistingsbylistingidactionswithdraw) | **Post** /api/events/{eventId}/listings/{listingId}/actions/withdraw | Withdraw a listing
+*ListingsAPI* | [**PostApiListingTypes**](docs/ListingsAPI.md#postapilistingtypes) | **Post** /api/listing-types | Create a listing type
+*MapDesignerAPI* | [**PostApiExtractSeats**](docs/MapDesignerAPI.md#postapiextractseats) | **Post** /api/extract-seats | Extract seat candidates from a floor-plan image
+*ObjectStatusAPI* | [**GetApiEventsByEventIdObjectStatuses**](docs/ObjectStatusAPI.md#getapieventsbyeventidobjectstatuses) | **Get** /api/events/{eventId}/object-statuses | List object status overlays for an event
+*ObjectStatusAPI* | [**PostApiEventsActionsChangeObjectStatus**](docs/ObjectStatusAPI.md#postapieventsactionschangeobjectstatus) | **Post** /api/events/actions/change-object-status | Atomically change object statuses across events (all-or-nothing batch)
+*ObjectStatusAPI* | [**PostApiEventsByEventIdActionsBook**](docs/ObjectStatusAPI.md#postapieventsbyeventidactionsbook) | **Post** /api/events/{eventId}/actions/book | Create a durable administrative booking on unheld inventory (or on a hold token)
+*ObjectStatusAPI* | [**PostApiEventsByEventIdActionsChangeObjectStatus**](docs/ObjectStatusAPI.md#postapieventsbyeventidactionschangeobjectstatus) | **Post** /api/events/{eventId}/actions/change-object-status | Change object status (booked / free / resale / retired / custom)
+*ObjectStatusAPI* | [**PostApiEventsByEventIdActionsHold**](docs/ObjectStatusAPI.md#postapieventsbyeventidactionshold) | **Post** /api/events/{eventId}/actions/hold | Hold general admission places administratively (issues a GA hold token)
+*ObjectStatusAPI* | [**PostApiEventsByEventIdActionsPutUpForResale**](docs/ObjectStatusAPI.md#postapieventsbyeventidactionsputupforresale) | **Post** /api/events/{eventId}/actions/put-up-for-resale | Put booked objects up for resale
+*ObjectStatusAPI* | [**PostApiEventsByEventIdActionsRelease**](docs/ObjectStatusAPI.md#postapieventsbyeventidactionsrelease) | **Post** /api/events/{eventId}/actions/release | Release unsold objects; sales require explicit order cancellation
+*ObjectStatusAPI* | [**PostApiEventsByEventIdActionsRetire**](docs/ObjectStatusAPI.md#postapieventsbyeventidactionsretire) | **Post** /api/events/{eventId}/actions/retire | Retire objects (not for sale, history kept)
+*ObjectStatusAPI* | [**PostApiEventsByEventIdActionsUpdateExtraData**](docs/ObjectStatusAPI.md#postapieventsbyeventidactionsupdateextradata) | **Post** /api/events/{eventId}/actions/update-extra-data | Update extraData of objects without changing their status
+*OrdersAPI* | [**GetApiOrdersByOrderId**](docs/OrdersAPI.md#getapiordersbyorderid) | **Get** /api/orders/{orderId} | Read a durable confirmation and its requested items
+*OrdersAPI* | [**PostApiOrdersByOrderIdCancel**](docs/OrdersAPI.md#postapiordersbyorderidcancel) | **Post** /api/orders/{orderId}/cancel | Cancel an order, or some of its seats, and preserve its history; does not refund payment
+*PublicAPI* | [**GetApiPublicByPublicKeyChartsByChartEmbedPolicy**](docs/PublicAPI.md#getapipublicbypublickeychartsbychartembedpolicy) | **Get** /api/public/{publicKey}/charts/{chart}/embed-policy | Map-only embed policy of a chart
+*PublicAPI* | [**GetApiPublicByPublicKeyChartsByChartGeometryByHash**](docs/PublicAPI.md#getapipublicbypublickeychartsbychartgeometrybyhash) | **Get** /api/public/{publicKey}/charts/{chart}/geometry/{hash} | Map-only chart geometry (immutable, CDN-cacheable)
+*PublicAPI* | [**GetApiPublicByPublicKeyChartsByChartManifest**](docs/PublicAPI.md#getapipublicbypublickeychartsbychartmanifest) | **Get** /api/public/{publicKey}/charts/{chart}/manifest | Map-only chart manifest (CDN-cacheable)
+*PublicAPI* | [**GetApiPublicByPublicKeyEventsByEventIdExtraData**](docs/PublicAPI.md#getapipublicbypublickeyeventsbyeventidextradata) | **Get** /api/public/{publicKey}/events/{eventId}/extra-data | Published buyer extraData of an event (workspace opt-in, CDN-cacheable)
+*PublicAPI* | [**GetApiPublicByPublicKeyEventsByEventIdGeometryByHash**](docs/PublicAPI.md#getapipublicbypublickeyeventsbyeventidgeometrybyhash) | **Get** /api/public/{publicKey}/events/{eventId}/geometry/{hash} | Public immutable geometry (CDN-cacheable)
+*PublicAPI* | [**GetApiPublicByPublicKeyEventsByEventIdManifest**](docs/PublicAPI.md#getapipublicbypublickeyeventsbyeventidmanifest) | **Get** /api/public/{publicKey}/events/{eventId}/manifest | Public geometry manifest (CDN-cacheable)
+*PublicAPI* | [**GetApiPublicByPublicKeyEventsByEventIdState**](docs/PublicAPI.md#getapipublicbypublickeyeventsbyeventidstate) | **Get** /api/public/{publicKey}/events/{eventId}/state | Public compact visual state (CDN-cacheable)
+*PublicAPI* | [**GetApiPublicChartPreviewsByChartIdGeometryByHash**](docs/PublicAPI.md#getapipublicchartpreviewsbychartidgeometrybyhash) | **Get** /api/public/chart-previews/{chartId}/geometry/{hash} | Chart preview geometry (signed link)
+*PublicAPI* | [**GetApiPublicChartPreviewsByChartIdManifest**](docs/PublicAPI.md#getapipublicchartpreviewsbychartidmanifest) | **Get** /api/public/chart-previews/{chartId}/manifest | Chart preview manifest (signed link)
+*QuotesAPI* | [**PostApiQuotes**](docs/QuotesAPI.md#postapiquotes) | **Post** /api/quotes | Freeze a server-calculated catalog quote before external payment
+*SandboxesAPI* | [**DeleteApiSandboxesBySandboxId**](docs/SandboxesAPI.md#deleteapisandboxesbysandboxid) | **Delete** /api/sandboxes/{sandboxId} | Delete a sandbox
+*SandboxesAPI* | [**GetApiSandboxes**](docs/SandboxesAPI.md#getapisandboxes) | **Get** /api/sandboxes | List the sandboxes of this workspace
+*SandboxesAPI* | [**GetApiSandboxesBySandboxId**](docs/SandboxesAPI.md#getapisandboxesbysandboxid) | **Get** /api/sandboxes/{sandboxId} | Get a sandbox
+*SandboxesAPI* | [**PostApiSandboxes**](docs/SandboxesAPI.md#postapisandboxes) | **Post** /api/sandboxes | Create a sandbox
+*SandboxesAPI* | [**PostApiSandboxesBySandboxIdActionsCopyFromProduction**](docs/SandboxesAPI.md#postapisandboxesbysandboxidactionscopyfromproduction) | **Post** /api/sandboxes/{sandboxId}/actions/copy-from-production | Copy charts (and events) from production into a sandbox
+*SandboxesAPI* | [**PostApiSandboxesBySandboxIdActionsJoin**](docs/SandboxesAPI.md#postapisandboxesbysandboxidactionsjoin) | **Post** /api/sandboxes/{sandboxId}/actions/join | Join a sandbox (dashboard)
+*SandboxesAPI* | [**PostApiSandboxesBySandboxIdActionsReset**](docs/SandboxesAPI.md#postapisandboxesbysandboxidactionsreset) | **Post** /api/sandboxes/{sandboxId}/actions/reset | Reset a sandbox
+*SandboxesAPI* | [**PostApiSandboxesBySandboxIdAdminKey**](docs/SandboxesAPI.md#postapisandboxesbysandboxidadminkey) | **Post** /api/sandboxes/{sandboxId}/admin-key | Create or rotate the sandbox admin key
+*SeasonsAPI* | [**DeleteApiSeasonsBySeasonId**](docs/SeasonsAPI.md#deleteapiseasonsbyseasonid) | **Delete** /api/seasons/{seasonId} | Delete season
+*SeasonsAPI* | [**DeleteApiSeasonsBySeasonIdEventsByEventId**](docs/SeasonsAPI.md#deleteapiseasonsbyseasonideventsbyeventid) | **Delete** /api/seasons/{seasonId}/events/{eventId} | Detach event from season
+*SeasonsAPI* | [**DeleteApiSeasonsBySeasonIdPartialSeasonsByPartialSeasonId**](docs/SeasonsAPI.md#deleteapiseasonsbyseasonidpartialseasonsbypartialseasonid) | **Delete** /api/seasons/{seasonId}/partial-seasons/{partialSeasonId} | Delete a partial season
+*SeasonsAPI* | [**GetApiEventsByEventIdSeasonStatus**](docs/SeasonsAPI.md#getapieventsbyeventidseasonstatus) | **Get** /api/events/{eventId}/season-status | Season membership and status overrides of an event
+*SeasonsAPI* | [**GetApiSeasons**](docs/SeasonsAPI.md#getapiseasons) | **Get** /api/seasons | List seasons
+*SeasonsAPI* | [**GetApiSeasonsBySeasonId**](docs/SeasonsAPI.md#getapiseasonsbyseasonid) | **Get** /api/seasons/{seasonId} | Get season detail
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdPartialSeasons**](docs/SeasonsAPI.md#getapiseasonsbyseasonidpartialseasons) | **Get** /api/seasons/{seasonId}/partial-seasons | List partial seasons of a season
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdPartialSeasonsByPartialSeasonId**](docs/SeasonsAPI.md#getapiseasonsbyseasonidpartialseasonsbypartialseasonid) | **Get** /api/seasons/{seasonId}/partial-seasons/{partialSeasonId} | Get one partial season
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdPartialSeasonsByPartialSeasonIdReportsByAvailabilityCsv**](docs/SeasonsAPI.md#getapiseasonsbyseasonidpartialseasonsbypartialseasonidreportsbyavailabilitycsv) | **Get** /api/seasons/{seasonId}/partial-seasons/{partialSeasonId}/reports/by-availability.csv | Partial season report by availability (CSV)
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdPartialSeasonsByPartialSeasonIdReportsByAvailabilityJson**](docs/SeasonsAPI.md#getapiseasonsbyseasonidpartialseasonsbypartialseasonidreportsbyavailabilityjson) | **Get** /api/seasons/{seasonId}/partial-seasons/{partialSeasonId}/reports/by-availability.json | Partial season report by availability
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdPartialSeasonsByPartialSeasonIdReportsByCategoryCsv**](docs/SeasonsAPI.md#getapiseasonsbyseasonidpartialseasonsbypartialseasonidreportsbycategorycsv) | **Get** /api/seasons/{seasonId}/partial-seasons/{partialSeasonId}/reports/by-category.csv | Partial season report by category (CSV)
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdPartialSeasonsByPartialSeasonIdReportsByCategoryJson**](docs/SeasonsAPI.md#getapiseasonsbyseasonidpartialseasonsbypartialseasonidreportsbycategoryjson) | **Get** /api/seasons/{seasonId}/partial-seasons/{partialSeasonId}/reports/by-category.json | Partial season report by category
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdPartialSeasonsByPartialSeasonIdReportsByStatusCsv**](docs/SeasonsAPI.md#getapiseasonsbyseasonidpartialseasonsbypartialseasonidreportsbystatuscsv) | **Get** /api/seasons/{seasonId}/partial-seasons/{partialSeasonId}/reports/by-status.csv | Partial season report by status (CSV)
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdPartialSeasonsByPartialSeasonIdReportsByStatusJson**](docs/SeasonsAPI.md#getapiseasonsbyseasonidpartialseasonsbypartialseasonidreportsbystatusjson) | **Get** /api/seasons/{seasonId}/partial-seasons/{partialSeasonId}/reports/by-status.json | Partial season report by status
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdPartialSeasonsByPartialSeasonIdReportsByZoneCsv**](docs/SeasonsAPI.md#getapiseasonsbyseasonidpartialseasonsbypartialseasonidreportsbyzonecsv) | **Get** /api/seasons/{seasonId}/partial-seasons/{partialSeasonId}/reports/by-zone.csv | Partial season report by zone (CSV)
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdPartialSeasonsByPartialSeasonIdReportsByZoneJson**](docs/SeasonsAPI.md#getapiseasonsbyseasonidpartialseasonsbypartialseasonidreportsbyzonejson) | **Get** /api/seasons/{seasonId}/partial-seasons/{partialSeasonId}/reports/by-zone.json | Partial season report by zone
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdPartialSeasonsByPartialSeasonIdReportsSummaryByAvailabilityCsv**](docs/SeasonsAPI.md#getapiseasonsbyseasonidpartialseasonsbypartialseasonidreportssummarybyavailabilitycsv) | **Get** /api/seasons/{seasonId}/partial-seasons/{partialSeasonId}/reports/summary/by-availability.csv | Partial season summary by availability (CSV)
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdPartialSeasonsByPartialSeasonIdReportsSummaryByAvailabilityJson**](docs/SeasonsAPI.md#getapiseasonsbyseasonidpartialseasonsbypartialseasonidreportssummarybyavailabilityjson) | **Get** /api/seasons/{seasonId}/partial-seasons/{partialSeasonId}/reports/summary/by-availability.json | Partial season summary by availability
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdPartialSeasonsByPartialSeasonIdReportsSummaryByAvailabilityReasonCsv**](docs/SeasonsAPI.md#getapiseasonsbyseasonidpartialseasonsbypartialseasonidreportssummarybyavailabilityreasoncsv) | **Get** /api/seasons/{seasonId}/partial-seasons/{partialSeasonId}/reports/summary/by-availability-reason.csv | Partial season summary by availability reason (CSV)
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdPartialSeasonsByPartialSeasonIdReportsSummaryByAvailabilityReasonJson**](docs/SeasonsAPI.md#getapiseasonsbyseasonidpartialseasonsbypartialseasonidreportssummarybyavailabilityreasonjson) | **Get** /api/seasons/{seasonId}/partial-seasons/{partialSeasonId}/reports/summary/by-availability-reason.json | Partial season summary by availability reason
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdPartialSeasonsByPartialSeasonIdReportsSummaryByCategoryCsv**](docs/SeasonsAPI.md#getapiseasonsbyseasonidpartialseasonsbypartialseasonidreportssummarybycategorycsv) | **Get** /api/seasons/{seasonId}/partial-seasons/{partialSeasonId}/reports/summary/by-category.csv | Partial season summary by category (CSV)
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdPartialSeasonsByPartialSeasonIdReportsSummaryByCategoryJson**](docs/SeasonsAPI.md#getapiseasonsbyseasonidpartialseasonsbypartialseasonidreportssummarybycategoryjson) | **Get** /api/seasons/{seasonId}/partial-seasons/{partialSeasonId}/reports/summary/by-category.json | Partial season summary by category
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdPartialSeasonsByPartialSeasonIdReportsSummaryBySectionCsv**](docs/SeasonsAPI.md#getapiseasonsbyseasonidpartialseasonsbypartialseasonidreportssummarybysectioncsv) | **Get** /api/seasons/{seasonId}/partial-seasons/{partialSeasonId}/reports/summary/by-section.csv | Partial season summary by section (CSV)
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdPartialSeasonsByPartialSeasonIdReportsSummaryBySectionJson**](docs/SeasonsAPI.md#getapiseasonsbyseasonidpartialseasonsbypartialseasonidreportssummarybysectionjson) | **Get** /api/seasons/{seasonId}/partial-seasons/{partialSeasonId}/reports/summary/by-section.json | Partial season summary by section
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdPartialSeasonsByPartialSeasonIdReportsSummaryByStatusCsv**](docs/SeasonsAPI.md#getapiseasonsbyseasonidpartialseasonsbypartialseasonidreportssummarybystatuscsv) | **Get** /api/seasons/{seasonId}/partial-seasons/{partialSeasonId}/reports/summary/by-status.csv | Partial season summary by status (CSV)
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdPartialSeasonsByPartialSeasonIdReportsSummaryByStatusJson**](docs/SeasonsAPI.md#getapiseasonsbyseasonidpartialseasonsbypartialseasonidreportssummarybystatusjson) | **Get** /api/seasons/{seasonId}/partial-seasons/{partialSeasonId}/reports/summary/by-status.json | Partial season summary by status
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdPartialSeasonsByPartialSeasonIdReportsSummaryByZoneCsv**](docs/SeasonsAPI.md#getapiseasonsbyseasonidpartialseasonsbypartialseasonidreportssummarybyzonecsv) | **Get** /api/seasons/{seasonId}/partial-seasons/{partialSeasonId}/reports/summary/by-zone.csv | Partial season summary by zone (CSV)
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdPartialSeasonsByPartialSeasonIdReportsSummaryByZoneJson**](docs/SeasonsAPI.md#getapiseasonsbyseasonidpartialseasonsbypartialseasonidreportssummarybyzonejson) | **Get** /api/seasons/{seasonId}/partial-seasons/{partialSeasonId}/reports/summary/by-zone.json | Partial season summary by zone
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdPartialSeasonsByPartialSeasonIdReportsSummaryCsv**](docs/SeasonsAPI.md#getapiseasonsbyseasonidpartialseasonsbypartialseasonidreportssummarycsv) | **Get** /api/seasons/{seasonId}/partial-seasons/{partialSeasonId}/reports/summary.csv | Partial season summary across member events (CSV)
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdPartialSeasonsByPartialSeasonIdReportsSummaryJson**](docs/SeasonsAPI.md#getapiseasonsbyseasonidpartialseasonsbypartialseasonidreportssummaryjson) | **Get** /api/seasons/{seasonId}/partial-seasons/{partialSeasonId}/reports/summary.json | Partial season summary across member events
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdReportsByAvailabilityCsv**](docs/SeasonsAPI.md#getapiseasonsbyseasonidreportsbyavailabilitycsv) | **Get** /api/seasons/{seasonId}/reports/by-availability.csv | Season report by availability (CSV)
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdReportsByAvailabilityJson**](docs/SeasonsAPI.md#getapiseasonsbyseasonidreportsbyavailabilityjson) | **Get** /api/seasons/{seasonId}/reports/by-availability.json | Season report by availability
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdReportsByCategoryCsv**](docs/SeasonsAPI.md#getapiseasonsbyseasonidreportsbycategorycsv) | **Get** /api/seasons/{seasonId}/reports/by-category.csv | Season report by category (CSV)
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdReportsByCategoryJson**](docs/SeasonsAPI.md#getapiseasonsbyseasonidreportsbycategoryjson) | **Get** /api/seasons/{seasonId}/reports/by-category.json | Season report by category
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdReportsByStatusCsv**](docs/SeasonsAPI.md#getapiseasonsbyseasonidreportsbystatuscsv) | **Get** /api/seasons/{seasonId}/reports/by-status.csv | Season report by status (CSV)
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdReportsByStatusJson**](docs/SeasonsAPI.md#getapiseasonsbyseasonidreportsbystatusjson) | **Get** /api/seasons/{seasonId}/reports/by-status.json | Season report by status
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdReportsByZoneCsv**](docs/SeasonsAPI.md#getapiseasonsbyseasonidreportsbyzonecsv) | **Get** /api/seasons/{seasonId}/reports/by-zone.csv | Season report by zone (CSV)
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdReportsByZoneJson**](docs/SeasonsAPI.md#getapiseasonsbyseasonidreportsbyzonejson) | **Get** /api/seasons/{seasonId}/reports/by-zone.json | Season report by zone
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdReportsSummaryByAvailabilityCsv**](docs/SeasonsAPI.md#getapiseasonsbyseasonidreportssummarybyavailabilitycsv) | **Get** /api/seasons/{seasonId}/reports/summary/by-availability.csv | Season summary by availability (CSV)
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdReportsSummaryByAvailabilityJson**](docs/SeasonsAPI.md#getapiseasonsbyseasonidreportssummarybyavailabilityjson) | **Get** /api/seasons/{seasonId}/reports/summary/by-availability.json | Season summary by availability
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdReportsSummaryByAvailabilityReasonCsv**](docs/SeasonsAPI.md#getapiseasonsbyseasonidreportssummarybyavailabilityreasoncsv) | **Get** /api/seasons/{seasonId}/reports/summary/by-availability-reason.csv | Season summary by availability reason (CSV)
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdReportsSummaryByAvailabilityReasonJson**](docs/SeasonsAPI.md#getapiseasonsbyseasonidreportssummarybyavailabilityreasonjson) | **Get** /api/seasons/{seasonId}/reports/summary/by-availability-reason.json | Season summary by availability reason
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdReportsSummaryByCategoryCsv**](docs/SeasonsAPI.md#getapiseasonsbyseasonidreportssummarybycategorycsv) | **Get** /api/seasons/{seasonId}/reports/summary/by-category.csv | Season summary by category (CSV)
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdReportsSummaryByCategoryJson**](docs/SeasonsAPI.md#getapiseasonsbyseasonidreportssummarybycategoryjson) | **Get** /api/seasons/{seasonId}/reports/summary/by-category.json | Season summary by category
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdReportsSummaryBySectionCsv**](docs/SeasonsAPI.md#getapiseasonsbyseasonidreportssummarybysectioncsv) | **Get** /api/seasons/{seasonId}/reports/summary/by-section.csv | Season summary by section (CSV)
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdReportsSummaryBySectionJson**](docs/SeasonsAPI.md#getapiseasonsbyseasonidreportssummarybysectionjson) | **Get** /api/seasons/{seasonId}/reports/summary/by-section.json | Season summary by section
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdReportsSummaryByStatusCsv**](docs/SeasonsAPI.md#getapiseasonsbyseasonidreportssummarybystatuscsv) | **Get** /api/seasons/{seasonId}/reports/summary/by-status.csv | Season summary by status (CSV)
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdReportsSummaryByStatusJson**](docs/SeasonsAPI.md#getapiseasonsbyseasonidreportssummarybystatusjson) | **Get** /api/seasons/{seasonId}/reports/summary/by-status.json | Season summary by status
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdReportsSummaryByZoneCsv**](docs/SeasonsAPI.md#getapiseasonsbyseasonidreportssummarybyzonecsv) | **Get** /api/seasons/{seasonId}/reports/summary/by-zone.csv | Season summary by zone (CSV)
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdReportsSummaryByZoneJson**](docs/SeasonsAPI.md#getapiseasonsbyseasonidreportssummarybyzonejson) | **Get** /api/seasons/{seasonId}/reports/summary/by-zone.json | Season summary by zone
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdReportsSummaryCsv**](docs/SeasonsAPI.md#getapiseasonsbyseasonidreportssummarycsv) | **Get** /api/seasons/{seasonId}/reports/summary.csv | Season summary across member events (CSV)
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdReportsSummaryJson**](docs/SeasonsAPI.md#getapiseasonsbyseasonidreportssummaryjson) | **Get** /api/seasons/{seasonId}/reports/summary.json | Season summary across member events
+*SeasonsAPI* | [**GetApiSeasonsBySeasonIdSeats**](docs/SeasonsAPI.md#getapiseasonsbyseasonidseats) | **Get** /api/seasons/{seasonId}/seats | Season booking view (source geometry + intersection status)
+*SeasonsAPI* | [**PatchApiSeasonsBySeasonId**](docs/SeasonsAPI.md#patchapiseasonsbyseasonid) | **Patch** /api/seasons/{seasonId} | Update season
+*SeasonsAPI* | [**PatchApiSeasonsBySeasonIdEventsByEventId**](docs/SeasonsAPI.md#patchapiseasonsbyseasonideventsbyeventid) | **Patch** /api/seasons/{seasonId}/events/{eventId} | Season member settings (forSalePropagated)
+*SeasonsAPI* | [**PatchApiSeasonsBySeasonIdPartialSeasonsByPartialSeasonId**](docs/SeasonsAPI.md#patchapiseasonsbyseasonidpartialseasonsbypartialseasonid) | **Patch** /api/seasons/{seasonId}/partial-seasons/{partialSeasonId} | Rename a partial season or set its key
+*SeasonsAPI* | [**PostApiEventsByEventIdActionsOverrideSeasonStatus**](docs/SeasonsAPI.md#postapieventsbyeventidactionsoverrideseasonstatus) | **Post** /api/events/{eventId}/actions/override-season-status | Override the season status of objects in an event (OVERRIDE_SEASON_STATUS)
+*SeasonsAPI* | [**PostApiEventsByEventIdActionsUseSeasonStatus**](docs/SeasonsAPI.md#postapieventsbyeventidactionsuseseasonstatus) | **Post** /api/events/{eventId}/actions/use-season-status | Make objects follow the season status again (USE_SEASON_STATUS)
+*SeasonsAPI* | [**PostApiSeasons**](docs/SeasonsAPI.md#postapiseasons) | **Post** /api/seasons | Create season
+*SeasonsAPI* | [**PostApiSeasonsBySeasonIdActionsAddEvents**](docs/SeasonsAPI.md#postapiseasonsbyseasonidactionsaddevents) | **Post** /api/seasons/{seasonId}/actions/add-events | Add several events to a season (atomic)
+*SeasonsAPI* | [**PostApiSeasonsBySeasonIdActionsCreateEvents**](docs/SeasonsAPI.md#postapiseasonsbyseasonidactionscreateevents) | **Post** /api/seasons/{seasonId}/actions/create-events | Create events in a season
+*SeasonsAPI* | [**PostApiSeasonsBySeasonIdActionsRemoveEvents**](docs/SeasonsAPI.md#postapiseasonsbyseasonidactionsremoveevents) | **Post** /api/seasons/{seasonId}/actions/remove-events | Remove several events from a season (atomic)
+*SeasonsAPI* | [**PostApiSeasonsBySeasonIdEvents**](docs/SeasonsAPI.md#postapiseasonsbyseasonidevents) | **Post** /api/seasons/{seasonId}/events | Attach event to season
+*SeasonsAPI* | [**PostApiSeasonsBySeasonIdInventorySync**](docs/SeasonsAPI.md#postapiseasonsbyseasonidinventorysync) | **Post** /api/seasons/{seasonId}/inventory/sync | Sync season inventory from source
+*SeasonsAPI* | [**PostApiSeasonsBySeasonIdPartialSeasons**](docs/SeasonsAPI.md#postapiseasonsbyseasonidpartialseasons) | **Post** /api/seasons/{seasonId}/partial-seasons | Create a partial season
+*SeasonsAPI* | [**PostApiSeasonsBySeasonIdPartialSeasonsByPartialSeasonIdActionsAddEvents**](docs/SeasonsAPI.md#postapiseasonsbyseasonidpartialseasonsbypartialseasonidactionsaddevents) | **Post** /api/seasons/{seasonId}/partial-seasons/{partialSeasonId}/actions/add-events | Add events to a partial season (bulk, all-or-nothing)
+*SeasonsAPI* | [**PostApiSeasonsBySeasonIdPartialSeasonsByPartialSeasonIdActionsRemoveEvents**](docs/SeasonsAPI.md#postapiseasonsbyseasonidpartialseasonsbypartialseasonidactionsremoveevents) | **Post** /api/seasons/{seasonId}/partial-seasons/{partialSeasonId}/actions/remove-events | Remove events from a partial season (bulk)
+*SeatsAPI* | [**GetApiChannels**](docs/SeatsAPI.md#getapichannels) | **Get** /api/channels | List sales channels
+*SeatsAPI* | [**GetApiHoldTokensByToken**](docs/SeatsAPI.md#getapiholdtokensbytoken) | **Get** /api/hold-tokens/{token} | Validate a hold-token session
+*SeatsAPI* | [**GetApiSeatsGroup**](docs/SeatsAPI.md#getapiseatsgroup) | **Get** /api/seats/group | Event-group availability intersection by label
+*SeatsAPI* | [**PostApiGaConfirm**](docs/SeatsAPI.md#postapigaconfirm) | **Post** /api/ga/confirm | Confirm GA purchase (Postgres sold_count)
+*SeatsAPI* | [**PostApiGaRelease**](docs/SeatsAPI.md#postapigarelease) | **Post** /api/ga/release | Release a GA capacity hold
+*SeatsAPI* | [**PostApiGaReserve**](docs/SeatsAPI.md#postapigareserve) | **Post** /api/ga/reserve | Hold GA area capacity (Redis)
+*SeatsAPI* | [**PostApiHoldTokens**](docs/SeatsAPI.md#postapiholdtokens) | **Post** /api/hold-tokens | Create an empty hold-token session
+*SeatsAPI* | [**PostApiHoldTokensByToken**](docs/SeatsAPI.md#postapiholdtokensbytoken) | **Post** /api/hold-tokens/{token} | Change hold-token expiration (max 2h from creation)
+*SeatsAPI* | [**PostApiSeatsBestAvailable**](docs/SeatsAPI.md#postapiseatsbestavailable) | **Post** /api/seats/best-available | Suggest or atomically hold best available seats
+*SeatsAPI* | [**PostApiSeatsConfirm**](docs/SeatsAPI.md#postapiseatsconfirm) | **Post** /api/seats/confirm | Accept a durable confirmation intent before asynchronous seat materialization
+*SeatsAPI* | [**PostApiSeatsHoldsRelease**](docs/SeatsAPI.md#postapiseatsholdsrelease) | **Post** /api/seats/holds/release | Release all seats held by a hold token
+*SeatsAPI* | [**PostApiSeatsHoldsRenew**](docs/SeatsAPI.md#postapiseatsholdsrenew) | **Post** /api/seats/holds/renew | Renew Redis TTL for all seats in a hold session
+*SeatsAPI* | [**PostApiSeatsRelease**](docs/SeatsAPI.md#postapiseatsrelease) | **Post** /api/seats/release | Clear Redis TTL holds before expiry (checkout abandoned / declined)
+*SeatsAPI* | [**PostApiSeatsReserve**](docs/SeatsAPI.md#postapiseatsreserve) | **Post** /api/seats/reserve | Place a temporary Redis hold (Lua TTL) before payment
+*SseAPI* | [**GetApiEventsByEventIdStream**](docs/SseAPI.md#getapieventsbyeventidstream) | **Get** /api/events/{eventId}/stream | Indexed visual projection stream
+*TeamAPI* | [**DeleteApiTeamInvitationsByInvitationId**](docs/TeamAPI.md#deleteapiteaminvitationsbyinvitationid) | **Delete** /api/team/invitations/{invitationId} | Revoke a pending invitation
+*TeamAPI* | [**DeleteApiTeamMembersByUserId**](docs/TeamAPI.md#deleteapiteammembersbyuserid) | **Delete** /api/team/members/{userId} | Remove member from workspace
+*TeamAPI* | [**GetApiTeamInvitations**](docs/TeamAPI.md#getapiteaminvitations) | **Get** /api/team/invitations | List pending invitations
+*TeamAPI* | [**GetApiTeamMembers**](docs/TeamAPI.md#getapiteammembers) | **Get** /api/team/members | List workspace members
+*TeamAPI* | [**PatchApiTeamMembersByUserId**](docs/TeamAPI.md#patchapiteammembersbyuserid) | **Patch** /api/team/members/{userId} | Change member role
+*TeamAPI* | [**PostApiTeamInvitations**](docs/TeamAPI.md#postapiteaminvitations) | **Post** /api/team/invitations | Invite a teammate by email
+*UsageAPI* | [**GetApiMonitoringRequests**](docs/UsageAPI.md#getapimonitoringrequests) | **Get** /api/monitoring/requests | Request monitoring per rate-limit lane, with in-flight (concurrent) requests
+*UsageAPI* | [**GetApiUsage**](docs/UsageAPI.md#getapiusage) | **Get** /api/usage | Monthly usage: used objects, charts and events
+*UsageAPI* | [**GetApiUsageCharts**](docs/UsageAPI.md#getapiusagecharts) | **Get** /api/usage/charts | Monthly used objects per chart and event
+*UsageAPI* | [**GetApiUsageEvents**](docs/UsageAPI.md#getapiusageevents) | **Get** /api/usage/events | Monthly used objects per event (paginated)
+*UsageAPI* | [**GetApiUsageEventsByEventId**](docs/UsageAPI.md#getapiusageeventsbyeventid) | **Get** /api/usage/events/{eventId} | Monthly used objects of one event (paginated)
+*UsageAPI* | [**GetApiUsageHistory**](docs/UsageAPI.md#getapiusagehistory) | **Get** /api/usage/history | Used objects per month over a range
+*UsageAPI* | [**GetApiUsageWorkspaces**](docs/UsageAPI.md#getapiusageworkspaces) | **Get** /api/usage/workspaces | Monthly used objects across my workspaces (admin view)
+*WebhooksAPI* | [**DeleteApiWebhooksById**](docs/WebhooksAPI.md#deleteapiwebhooksbyid) | **Delete** /api/webhooks/{id} | Delete a webhook
+*WebhooksAPI* | [**GetApiWebhooks**](docs/WebhooksAPI.md#getapiwebhooks) | **Get** /api/webhooks | List webhooks for the authenticated tenant
+*WebhooksAPI* | [**GetApiWebhooksByIdDeliveries**](docs/WebhooksAPI.md#getapiwebhooksbyiddeliveries) | **Get** /api/webhooks/{id}/deliveries | List deliveries of a webhook endpoint
+*WebhooksAPI* | [**GetApiWebhooksByIdDeliveriesByDeliveryId**](docs/WebhooksAPI.md#getapiwebhooksbyiddeliveriesbydeliveryid) | **Get** /api/webhooks/{id}/deliveries/{deliveryId} | Get one webhook delivery with its request payload
+*WebhooksAPI* | [**GetApiWebhooksEventTypes**](docs/WebhooksAPI.md#getapiwebhookseventtypes) | **Get** /api/webhooks/event-types | List subscribable webhook event types
+*WebhooksAPI* | [**PatchApiWebhooksById**](docs/WebhooksAPI.md#patchapiwebhooksbyid) | **Patch** /api/webhooks/{id} | Update a webhook
+*WebhooksAPI* | [**PostApiWebhooks**](docs/WebhooksAPI.md#postapiwebhooks) | **Post** /api/webhooks | Create a webhook endpoint
+*WebhooksAPI* | [**PostApiWebhooksByIdDeliveriesByDeliveryIdReplay**](docs/WebhooksAPI.md#postapiwebhooksbyiddeliveriesbydeliveryidreplay) | **Post** /api/webhooks/{id}/deliveries/{deliveryId}/replay | Replay a webhook delivery
+*WebhooksAPI* | [**PostApiWebhooksByIdRotateSecret**](docs/WebhooksAPI.md#postapiwebhooksbyidrotatesecret) | **Post** /api/webhooks/{id}/rotate-secret | Rotate a webhook signing secret
+*WebhooksAPI* | [**PostApiWebhooksByIdTest**](docs/WebhooksAPI.md#postapiwebhooksbyidtest) | **Post** /api/webhooks/{id}/test | Send a signed test event
+*WorkspaceAPI* | [**DeleteApiWorkspacesByWorkspaceId**](docs/WorkspaceAPI.md#deleteapiworkspacesbyworkspaceid) | **Delete** /api/workspaces/{workspaceId} | Deactivate a workspace (legacy DELETE)
+*WorkspaceAPI* | [**DeleteApiWorkspacesByWorkspaceIdInvitationsByInvitationId**](docs/WorkspaceAPI.md#deleteapiworkspacesbyworkspaceidinvitationsbyinvitationid) | **Delete** /api/workspaces/{workspaceId}/invitations/{invitationId} | Revoke a pending invitation of a workspace you administer
+*WorkspaceAPI* | [**DeleteApiWorkspacesByWorkspaceIdKeysByKeyId**](docs/WorkspaceAPI.md#deleteapiworkspacesbyworkspaceidkeysbykeyid) | **Delete** /api/workspaces/{workspaceId}/keys/{keyId} | Revoke a key of a workspace you administer
+*WorkspaceAPI* | [**DeleteApiWorkspacesByWorkspaceIdMembersByUserId**](docs/WorkspaceAPI.md#deleteapiworkspacesbyworkspaceidmembersbyuserid) | **Delete** /api/workspaces/{workspaceId}/members/{userId} | Remove a member from a workspace you administer
+*WorkspaceAPI* | [**GetApiWorkspace**](docs/WorkspaceAPI.md#getapiworkspace) | **Get** /api/workspace | Get workspace profile for the authenticated tenant
+*WorkspaceAPI* | [**GetApiWorkspaceBuyerExtraData**](docs/WorkspaceAPI.md#getapiworkspacebuyerextradata) | **Get** /api/workspace/buyer-extra-data | Get the buyer extraData publication (opt-in, allow-listed keys)
+*WorkspaceAPI* | [**GetApiWorkspaceChartValidation**](docs/WorkspaceAPI.md#getapiworkspacechartvalidation) | **Get** /api/workspace/chart-validation | Get chart validation severities
+*WorkspaceAPI* | [**GetApiWorkspaceDefaults**](docs/WorkspaceAPI.md#getapiworkspacedefaults) | **Get** /api/workspace/defaults | Get the workspace defaults (renderer settings, draft chart drawings)
+*WorkspaceAPI* | [**GetApiWorkspaceIntegration**](docs/WorkspaceAPI.md#getapiworkspaceintegration) | **Get** /api/workspace/integration | Get the workspace integration mode (pricing source)
+*WorkspaceAPI* | [**GetApiWorkspaceSettings**](docs/WorkspaceAPI.md#getapiworkspacesettings) | **Get** /api/workspace/settings | Get workspace settings (effective value and source)
+*WorkspaceAPI* | [**GetApiWorkspaces**](docs/WorkspaceAPI.md#getapiworkspaces) | **Get** /api/workspaces | List my workspaces
+*WorkspaceAPI* | [**GetApiWorkspacesByExternalIdByExternalId**](docs/WorkspaceAPI.md#getapiworkspacesbyexternalidbyexternalid) | **Get** /api/workspaces/by-external-id/{externalId} | Get one of my workspaces by its external id
+*WorkspaceAPI* | [**GetApiWorkspacesByWorkspaceId**](docs/WorkspaceAPI.md#getapiworkspacesbyworkspaceid) | **Get** /api/workspaces/{workspaceId} | Get one of my workspaces
+*WorkspaceAPI* | [**GetApiWorkspacesByWorkspaceIdInvitations**](docs/WorkspaceAPI.md#getapiworkspacesbyworkspaceidinvitations) | **Get** /api/workspaces/{workspaceId}/invitations | List the pending invitations of a workspace you administer
+*WorkspaceAPI* | [**GetApiWorkspacesByWorkspaceIdKeys**](docs/WorkspaceAPI.md#getapiworkspacesbyworkspaceidkeys) | **Get** /api/workspaces/{workspaceId}/keys | List the API keys of a workspace you administer
+*WorkspaceAPI* | [**GetApiWorkspacesByWorkspaceIdMembers**](docs/WorkspaceAPI.md#getapiworkspacesbyworkspaceidmembers) | **Get** /api/workspaces/{workspaceId}/members | List the members of a workspace you administer
+*WorkspaceAPI* | [**GetApiWorkspacesOverview**](docs/WorkspaceAPI.md#getapiworkspacesoverview) | **Get** /api/workspaces/overview | Consolidated overview of the organizer workspaces you administer
+*WorkspaceAPI* | [**PatchApiWorkspace**](docs/WorkspaceAPI.md#patchapiworkspace) | **Patch** /api/workspace | Update workspace display name
+*WorkspaceAPI* | [**PatchApiWorkspaceChartValidation**](docs/WorkspaceAPI.md#patchapiworkspacechartvalidation) | **Patch** /api/workspace/chart-validation | Update chart validation severities
+*WorkspaceAPI* | [**PatchApiWorkspaceDefaults**](docs/WorkspaceAPI.md#patchapiworkspacedefaults) | **Patch** /api/workspace/defaults | Change the workspace defaults (renderer settings, draft chart drawings)
+*WorkspaceAPI* | [**PatchApiWorkspaceIntegration**](docs/WorkspaceAPI.md#patchapiworkspaceintegration) | **Patch** /api/workspace/integration | Change the workspace integration mode
+*WorkspaceAPI* | [**PatchApiWorkspaceSettings**](docs/WorkspaceAPI.md#patchapiworkspacesettings) | **Patch** /api/workspace/settings | Override workspace settings or return them to the default
+*WorkspaceAPI* | [**PatchApiWorkspacesByWorkspaceId**](docs/WorkspaceAPI.md#patchapiworkspacesbyworkspaceid) | **Patch** /api/workspaces/{workspaceId} | Rename one of my workspaces or change its external id
+*WorkspaceAPI* | [**PatchApiWorkspacesByWorkspaceIdKeysByKeyId**](docs/WorkspaceAPI.md#patchapiworkspacesbyworkspaceidkeysbykeyid) | **Patch** /api/workspaces/{workspaceId}/keys/{keyId} | Rename a key of a workspace you administer or change its scopes
+*WorkspaceAPI* | [**PostApiWorkspacePublicKeyRotate**](docs/WorkspaceAPI.md#postapiworkspacepublickeyrotate) | **Post** /api/workspace/public-key/rotate | Rotate the public workspace key
+*WorkspaceAPI* | [**PostApiWorkspaces**](docs/WorkspaceAPI.md#postapiworkspaces) | **Post** /api/workspaces | Create a workspace (provision an organizer)
+*WorkspaceAPI* | [**PostApiWorkspacesByWorkspaceIdActionsActivate**](docs/WorkspaceAPI.md#postapiworkspacesbyworkspaceidactionsactivate) | **Post** /api/workspaces/{workspaceId}/actions/activate | Reactivate a workspace
+*WorkspaceAPI* | [**PostApiWorkspacesByWorkspaceIdActionsDeactivate**](docs/WorkspaceAPI.md#postapiworkspacesbyworkspaceidactionsdeactivate) | **Post** /api/workspaces/{workspaceId}/actions/deactivate | Deactivate a workspace
+*WorkspaceAPI* | [**PostApiWorkspacesByWorkspaceIdActionsDelete**](docs/WorkspaceAPI.md#postapiworkspacesbyworkspaceidactionsdelete) | **Post** /api/workspaces/{workspaceId}/actions/delete | Delete a workspace
+*WorkspaceAPI* | [**PostApiWorkspacesByWorkspaceIdActionsSetDefault**](docs/WorkspaceAPI.md#postapiworkspacesbyworkspaceidactionssetdefault) | **Post** /api/workspaces/{workspaceId}/actions/set-default | Set my default workspace
+*WorkspaceAPI* | [**PostApiWorkspacesByWorkspaceIdInvitations**](docs/WorkspaceAPI.md#postapiworkspacesbyworkspaceidinvitations) | **Post** /api/workspaces/{workspaceId}/invitations | Invite a person to a workspace you administer
+*WorkspaceAPI* | [**PostApiWorkspacesByWorkspaceIdKeys**](docs/WorkspaceAPI.md#postapiworkspacesbyworkspaceidkeys) | **Post** /api/workspaces/{workspaceId}/keys | Mint an API key in a workspace you administer
+*WorkspaceAPI* | [**PostApiWorkspacesByWorkspaceIdKeysByKeyIdActionsRotate**](docs/WorkspaceAPI.md#postapiworkspacesbyworkspaceidkeysbykeyidactionsrotate) | **Post** /api/workspaces/{workspaceId}/keys/{keyId}/actions/rotate | Rotate the secret of a key of a workspace you administer
+*WorkspaceAPI* | [**PutApiWorkspaceBuyerExtraData**](docs/WorkspaceAPI.md#putapiworkspacebuyerextradata) | **Put** /api/workspace/buyer-extra-data | Publish selected extraData keys to buyers (or stop)
+
+
+## Documentation For Models
+
+ - [ApiError](docs/ApiError.md)
+ - [ApiErrorParamsValue](docs/ApiErrorParamsValue.md)
+ - [DeleteApiSandboxesBySandboxId200Response](docs/DeleteApiSandboxesBySandboxId200Response.md)
+ - [DeleteApiWorkspacesByWorkspaceId200Response](docs/DeleteApiWorkspacesByWorkspaceId200Response.md)
+ - [DeleteApiWorkspacesByWorkspaceIdKeysByKeyId200Response](docs/DeleteApiWorkspacesByWorkspaceIdKeysByKeyId200Response.md)
+ - [DeleteApiWorkspacesByWorkspaceIdMembersByUserId200Response](docs/DeleteApiWorkspacesByWorkspaceIdMembersByUserId200Response.md)
+ - [GetApiChartsByChartIdVersions200Response](docs/GetApiChartsByChartIdVersions200Response.md)
+ - [GetApiChartsByChartIdVersions200ResponseItemsInner](docs/GetApiChartsByChartIdVersions200ResponseItemsInner.md)
+ - [GetApiChartsByChartIdVersions200ResponseItemsInnerPublishedBy](docs/GetApiChartsByChartIdVersions200ResponseItemsInnerPublishedBy.md)
+ - [GetApiEventsByEventIdMapVersions200Response](docs/GetApiEventsByEventIdMapVersions200Response.md)
+ - [GetApiEventsByEventIdMapVersions200ResponseItemsInner](docs/GetApiEventsByEventIdMapVersions200ResponseItemsInner.md)
+ - [GetApiEventsByEventIdSeatViews200Response](docs/GetApiEventsByEventIdSeatViews200Response.md)
+ - [GetApiEventsByEventIdSeatViews200ResponseViewsValue](docs/GetApiEventsByEventIdSeatViews200ResponseViewsValue.md)
+ - [GetApiEventsByEventIdSeatViews404Response](docs/GetApiEventsByEventIdSeatViews404Response.md)
+ - [GetApiMonitoringRequests200Response](docs/GetApiMonitoringRequests200Response.md)
+ - [GetApiMonitoringRequests200ResponseConcurrency](docs/GetApiMonitoringRequests200ResponseConcurrency.md)
+ - [GetApiMonitoringRequests200ResponseConcurrencyApiKeysInner](docs/GetApiMonitoringRequests200ResponseConcurrencyApiKeysInner.md)
+ - [GetApiMonitoringRequests200ResponseLanes](docs/GetApiMonitoringRequests200ResponseLanes.md)
+ - [GetApiMonitoringRequests200ResponseLanesSales](docs/GetApiMonitoringRequests200ResponseLanesSales.md)
+ - [GetApiMonitoringRequests200ResponsePointsInner](docs/GetApiMonitoringRequests200ResponsePointsInner.md)
+ - [GetApiSandboxes200Response](docs/GetApiSandboxes200Response.md)
+ - [GetApiSandboxes200ResponseItemsInner](docs/GetApiSandboxes200ResponseItemsInner.md)
+ - [GetApiSandboxes200ResponseItemsInnerRateLimits](docs/GetApiSandboxes200ResponseItemsInnerRateLimits.md)
+ - [GetApiSandboxes200ResponseItemsInnerUsage](docs/GetApiSandboxes200ResponseItemsInnerUsage.md)
+ - [GetApiStatus200Response](docs/GetApiStatus200Response.md)
+ - [GetApiStatus200ResponseComponentsInner](docs/GetApiStatus200ResponseComponentsInner.md)
+ - [GetApiStatus200ResponseComponentsInnerDaysInner](docs/GetApiStatus200ResponseComponentsInnerDaysInner.md)
+ - [GetApiStatus200ResponseIncidentsInner](docs/GetApiStatus200ResponseIncidentsInner.md)
+ - [GetApiStatus200ResponseMaintenanceInner](docs/GetApiStatus200ResponseMaintenanceInner.md)
+ - [GetApiStatus503Response](docs/GetApiStatus503Response.md)
+ - [GetApiWorkspaceBuyerExtraData200Response](docs/GetApiWorkspaceBuyerExtraData200Response.md)
+ - [GetApiWorkspaceDefaults200Response](docs/GetApiWorkspaceDefaults200Response.md)
+ - [GetApiWorkspaceDefaults200ResponseRenderer](docs/GetApiWorkspaceDefaults200ResponseRenderer.md)
+ - [GetApiWorkspaceDefaults200ResponseRendererBuiltIn](docs/GetApiWorkspaceDefaults200ResponseRendererBuiltIn.md)
+ - [GetApiWorkspaceIntegration200Response](docs/GetApiWorkspaceIntegration200Response.md)
+ - [GetApiWorkspaceSettings200Response](docs/GetApiWorkspaceSettings200Response.md)
+ - [GetApiWorkspaceSettings200ResponseBounds](docs/GetApiWorkspaceSettings200ResponseBounds.md)
+ - [GetApiWorkspaceSettings200ResponseBoundsHoldPeriodMinutes](docs/GetApiWorkspaceSettings200ResponseBoundsHoldPeriodMinutes.md)
+ - [GetApiWorkspaceSettings200ResponseEffective](docs/GetApiWorkspaceSettings200ResponseEffective.md)
+ - [GetApiWorkspaceSettings200ResponseOverrides](docs/GetApiWorkspaceSettings200ResponseOverrides.md)
+ - [GetApiWorkspaceSettings200ResponseSources](docs/GetApiWorkspaceSettings200ResponseSources.md)
+ - [GetApiWorkspaces200Response](docs/GetApiWorkspaces200Response.md)
+ - [GetApiWorkspaces200ResponseItemsInner](docs/GetApiWorkspaces200ResponseItemsInner.md)
+ - [GetApiWorkspacesByWorkspaceIdInvitations200Response](docs/GetApiWorkspacesByWorkspaceIdInvitations200Response.md)
+ - [GetApiWorkspacesByWorkspaceIdInvitations200ResponseInvitationsInner](docs/GetApiWorkspacesByWorkspaceIdInvitations200ResponseInvitationsInner.md)
+ - [GetApiWorkspacesByWorkspaceIdKeys200Response](docs/GetApiWorkspacesByWorkspaceIdKeys200Response.md)
+ - [GetApiWorkspacesByWorkspaceIdKeys200ResponseApiKeysInner](docs/GetApiWorkspacesByWorkspaceIdKeys200ResponseApiKeysInner.md)
+ - [GetApiWorkspacesByWorkspaceIdMembers200Response](docs/GetApiWorkspacesByWorkspaceIdMembers200Response.md)
+ - [GetApiWorkspacesByWorkspaceIdMembers200ResponseMembersInner](docs/GetApiWorkspacesByWorkspaceIdMembers200ResponseMembersInner.md)
+ - [GetApiWorkspacesOverview200Response](docs/GetApiWorkspacesOverview200Response.md)
+ - [GetApiWorkspacesOverview200ResponseAccount](docs/GetApiWorkspacesOverview200ResponseAccount.md)
+ - [GetApiWorkspacesOverview200ResponseAccountCharts](docs/GetApiWorkspacesOverview200ResponseAccountCharts.md)
+ - [GetApiWorkspacesOverview200ResponseAccountPlan](docs/GetApiWorkspacesOverview200ResponseAccountPlan.md)
+ - [GetApiWorkspacesOverview200ResponseItemsInner](docs/GetApiWorkspacesOverview200ResponseItemsInner.md)
+ - [GetApiWorkspacesOverview200ResponseItemsInnerRevenue](docs/GetApiWorkspacesOverview200ResponseItemsInnerRevenue.md)
+ - [GetApiWorkspacesOverview200ResponseItemsInnerUsage](docs/GetApiWorkspacesOverview200ResponseItemsInnerUsage.md)
+ - [GetApiWorkspacesOverview200ResponseSeats](docs/GetApiWorkspacesOverview200ResponseSeats.md)
+ - [GetApiWorkspacesOverview200ResponseSeatsOverage](docs/GetApiWorkspacesOverview200ResponseSeatsOverage.md)
+ - [GetApiWorkspacesOverview200ResponseSeatsProjected](docs/GetApiWorkspacesOverview200ResponseSeatsProjected.md)
+ - [GetApiWorkspacesOverview200ResponseTotals](docs/GetApiWorkspacesOverview200ResponseTotals.md)
+ - [GetApiWorkspacesOverview200ResponseTotalsRevenue](docs/GetApiWorkspacesOverview200ResponseTotalsRevenue.md)
+ - [GetApiWorkspacesOverview200ResponseTotalsSeats](docs/GetApiWorkspacesOverview200ResponseTotalsSeats.md)
+ - [PatchApiChartsByChartIdCategoriesByCategoryIdRequest](docs/PatchApiChartsByChartIdCategoriesByCategoryIdRequest.md)
+ - [PatchApiChartsByChartIdRequest](docs/PatchApiChartsByChartIdRequest.md)
+ - [PatchApiEventsByEventIdInventoryChannelsByChannelKeyIdRequest](docs/PatchApiEventsByEventIdInventoryChannelsByChannelKeyIdRequest.md)
+ - [PatchApiEventsByEventIdListingsByListingIdRequest](docs/PatchApiEventsByEventIdListingsByListingIdRequest.md)
+ - [PatchApiEventsByEventIdRequest](docs/PatchApiEventsByEventIdRequest.md)
+ - [PatchApiEventsByEventIdRequestTableBookingConfig](docs/PatchApiEventsByEventIdRequestTableBookingConfig.md)
+ - [PatchApiKeysByIdRequest](docs/PatchApiKeysByIdRequest.md)
+ - [PatchApiListingTypesByKeyRequest](docs/PatchApiListingTypesByKeyRequest.md)
+ - [PatchApiSeasonsBySeasonIdEventsByEventIdRequest](docs/PatchApiSeasonsBySeasonIdEventsByEventIdRequest.md)
+ - [PatchApiSeasonsBySeasonIdPartialSeasonsByPartialSeasonIdRequest](docs/PatchApiSeasonsBySeasonIdPartialSeasonsByPartialSeasonIdRequest.md)
+ - [PatchApiSeasonsBySeasonIdRequest](docs/PatchApiSeasonsBySeasonIdRequest.md)
+ - [PatchApiTeamMembersByUserIdRequest](docs/PatchApiTeamMembersByUserIdRequest.md)
+ - [PatchApiWebhooksByIdRequest](docs/PatchApiWebhooksByIdRequest.md)
+ - [PatchApiWorkspaceChartValidationRequest](docs/PatchApiWorkspaceChartValidationRequest.md)
+ - [PatchApiWorkspaceChartValidationRequestSeverities](docs/PatchApiWorkspaceChartValidationRequestSeverities.md)
+ - [PatchApiWorkspaceDefaultsRequest](docs/PatchApiWorkspaceDefaultsRequest.md)
+ - [PatchApiWorkspaceDefaultsRequestRenderer](docs/PatchApiWorkspaceDefaultsRequestRenderer.md)
+ - [PatchApiWorkspaceIntegrationRequest](docs/PatchApiWorkspaceIntegrationRequest.md)
+ - [PatchApiWorkspaceRequest](docs/PatchApiWorkspaceRequest.md)
+ - [PatchApiWorkspaceSettingsRequest](docs/PatchApiWorkspaceSettingsRequest.md)
+ - [PatchApiWorkspacesByWorkspaceIdKeysByKeyId200Response](docs/PatchApiWorkspacesByWorkspaceIdKeysByKeyId200Response.md)
+ - [PatchApiWorkspacesByWorkspaceIdKeysByKeyIdRequest](docs/PatchApiWorkspacesByWorkspaceIdKeysByKeyIdRequest.md)
+ - [PatchApiWorkspacesByWorkspaceIdRequest](docs/PatchApiWorkspacesByWorkspaceIdRequest.md)
+ - [PostApiAuth2faDisableRequest](docs/PostApiAuth2faDisableRequest.md)
+ - [PostApiAuth2faEnableRequest](docs/PostApiAuth2faEnableRequest.md)
+ - [PostApiAuth2faEnrollConfirmRequest](docs/PostApiAuth2faEnrollConfirmRequest.md)
+ - [PostApiAuth2faEnrollStartRequest](docs/PostApiAuth2faEnrollStartRequest.md)
+ - [PostApiAuth2faVerifyRequest](docs/PostApiAuth2faVerifyRequest.md)
+ - [PostApiAuthAcceptInviteRequest](docs/PostApiAuthAcceptInviteRequest.md)
+ - [PostApiAuthLoginRequest](docs/PostApiAuthLoginRequest.md)
+ - [PostApiAuthLogoutRequest](docs/PostApiAuthLogoutRequest.md)
+ - [PostApiAuthNewWorkspaceRequest](docs/PostApiAuthNewWorkspaceRequest.md)
+ - [PostApiAuthRefreshRequest](docs/PostApiAuthRefreshRequest.md)
+ - [PostApiAuthSignupRequest](docs/PostApiAuthSignupRequest.md)
+ - [PostApiAuthSwitchWorkspaceRequest](docs/PostApiAuthSwitchWorkspaceRequest.md)
+ - [PostApiBillingActionsChangePlanRequest](docs/PostApiBillingActionsChangePlanRequest.md)
+ - [PostApiBillingCheckoutSessionRequest](docs/PostApiBillingCheckoutSessionRequest.md)
+ - [PostApiBillingConfirmCheckoutRequest](docs/PostApiBillingConfirmCheckoutRequest.md)
+ - [PostApiChartsByChartIdActionsArchive200Response](docs/PostApiChartsByChartIdActionsArchive200Response.md)
+ - [PostApiChartsByChartIdActionsArchive200ResponseChart](docs/PostApiChartsByChartIdActionsArchive200ResponseChart.md)
+ - [PostApiChartsByChartIdActionsCopyToWorkspaceRequest](docs/PostApiChartsByChartIdActionsCopyToWorkspaceRequest.md)
+ - [PostApiChartsByChartIdActionsValidateRequest](docs/PostApiChartsByChartIdActionsValidateRequest.md)
+ - [PostApiChartsByChartIdActionsValidateRequestSeatsInner](docs/PostApiChartsByChartIdActionsValidateRequestSeatsInner.md)
+ - [PostApiChartsByChartIdActionsValidateRequestSeatsInnerAccessibility](docs/PostApiChartsByChartIdActionsValidateRequestSeatsInnerAccessibility.md)
+ - [PostApiChartsByChartIdCategoriesRequest](docs/PostApiChartsByChartIdCategoriesRequest.md)
+ - [PostApiChartsByChartIdCategoriesRequestTicketTypesInner](docs/PostApiChartsByChartIdCategoriesRequestTicketTypesInner.md)
+ - [PostApiChartsByChartIdDuplicateRequest](docs/PostApiChartsByChartIdDuplicateRequest.md)
+ - [PostApiChartsByChartIdMapPublish422Response](docs/PostApiChartsByChartIdMapPublish422Response.md)
+ - [PostApiChartsByChartIdMapPublish422ResponseIssuesInner](docs/PostApiChartsByChartIdMapPublish422ResponseIssuesInner.md)
+ - [PostApiChartsByChartIdMapPublishRequest](docs/PostApiChartsByChartIdMapPublishRequest.md)
+ - [PostApiChartsByChartIdPreviewLinkRequest](docs/PostApiChartsByChartIdPreviewLinkRequest.md)
+ - [PostApiChartsByChartIdVersionsByVersionActionsCopyRequest](docs/PostApiChartsByChartIdVersionsByVersionActionsCopyRequest.md)
+ - [PostApiChartsRequest](docs/PostApiChartsRequest.md)
+ - [PostApiChartsRequestCategoriesInner](docs/PostApiChartsRequestCategoriesInner.md)
+ - [PostApiEmbedOriginsRequest](docs/PostApiEmbedOriginsRequest.md)
+ - [PostApiEmbedTokensRequest](docs/PostApiEmbedTokensRequest.md)
+ - [PostApiEmbedTokensRequestSafeModeOptions](docs/PostApiEmbedTokensRequestSafeModeOptions.md)
+ - [PostApiEventsActionsChangeObjectStatusRequest](docs/PostApiEventsActionsChangeObjectStatusRequest.md)
+ - [PostApiEventsActionsChangeObjectStatusRequestStatusChangesInner](docs/PostApiEventsActionsChangeObjectStatusRequestStatusChangesInner.md)
+ - [PostApiEventsActionsChangeObjectStatusRequestStatusChangesInnerObjectsInner](docs/PostApiEventsActionsChangeObjectStatusRequestStatusChangesInnerObjectsInner.md)
+ - [PostApiEventsActionsChangeObjectStatusRequestStatusChangesInnerObjectsInnerAnyOf](docs/PostApiEventsActionsChangeObjectStatusRequestStatusChangesInnerObjectsInnerAnyOf.md)
+ - [PostApiEventsActionsEditForSaleConfigRequest](docs/PostApiEventsActionsEditForSaleConfigRequest.md)
+ - [PostApiEventsActionsEditForSaleConfigRequestEventsInner](docs/PostApiEventsActionsEditForSaleConfigRequestEventsInner.md)
+ - [PostApiEventsBulkRequest](docs/PostApiEventsBulkRequest.md)
+ - [PostApiEventsBulkRequestEventsInner](docs/PostApiEventsBulkRequestEventsInner.md)
+ - [PostApiEventsByEventIdActionsChangeObjectStatusRequest](docs/PostApiEventsByEventIdActionsChangeObjectStatusRequest.md)
+ - [PostApiEventsByEventIdActionsChangeObjectStatusRequestListing](docs/PostApiEventsByEventIdActionsChangeObjectStatusRequestListing.md)
+ - [PostApiEventsByEventIdActionsEditForSaleConfigRequest](docs/PostApiEventsByEventIdActionsEditForSaleConfigRequest.md)
+ - [PostApiEventsByEventIdActionsEditForSaleConfigRequestForSaleInner](docs/PostApiEventsByEventIdActionsEditForSaleConfigRequestForSaleInner.md)
+ - [PostApiEventsByEventIdActionsMarkEverythingAsNotForSaleRequest](docs/PostApiEventsByEventIdActionsMarkEverythingAsNotForSaleRequest.md)
+ - [PostApiEventsByEventIdActionsOverrideSeasonStatusRequest](docs/PostApiEventsByEventIdActionsOverrideSeasonStatusRequest.md)
+ - [PostApiEventsByEventIdActionsUpdateExtraDataRequest](docs/PostApiEventsByEventIdActionsUpdateExtraDataRequest.md)
+ - [PostApiEventsByEventIdActionsUpdateExtraDataRequestObjectsInner](docs/PostApiEventsByEventIdActionsUpdateExtraDataRequestObjectsInner.md)
+ - [PostApiEventsByEventIdActionsUseSeasonStatusRequest](docs/PostApiEventsByEventIdActionsUseSeasonStatusRequest.md)
+ - [PostApiEventsByEventIdDuplicateRequest](docs/PostApiEventsByEventIdDuplicateRequest.md)
+ - [PostApiEventsByEventIdInventoryChannelsAssignRequest](docs/PostApiEventsByEventIdInventoryChannelsAssignRequest.md)
+ - [PostApiEventsByEventIdInventoryChannelsRequest](docs/PostApiEventsByEventIdInventoryChannelsRequest.md)
+ - [PostApiEventsByEventIdInventoryForSaleApplyRequest](docs/PostApiEventsByEventIdInventoryForSaleApplyRequest.md)
+ - [PostApiEventsByEventIdListingsByListingIdActionsMarkSoldRequest](docs/PostApiEventsByEventIdListingsByListingIdActionsMarkSoldRequest.md)
+ - [PostApiEventsByEventIdListingsRequest](docs/PostApiEventsByEventIdListingsRequest.md)
+ - [PostApiEventsByEventIdListingsRequestObjectsInner](docs/PostApiEventsByEventIdListingsRequestObjectsInner.md)
+ - [PostApiEventsByEventIdListingsRequestObjectsInnerAnyOf](docs/PostApiEventsByEventIdListingsRequestObjectsInnerAnyOf.md)
+ - [PostApiEventsByEventIdMapPublishRequest](docs/PostApiEventsByEventIdMapPublishRequest.md)
+ - [PostApiEventsByEventIdObjectsActionsRetrieveRequest](docs/PostApiEventsByEventIdObjectsActionsRetrieveRequest.md)
+ - [PostApiEventsRequest](docs/PostApiEventsRequest.md)
+ - [PostApiEventsRequestCategoriesInner](docs/PostApiEventsRequestCategoriesInner.md)
+ - [PostApiEventsRequestCategoryOverridesValue](docs/PostApiEventsRequestCategoryOverridesValue.md)
+ - [PostApiEventsRequestChannelsInner](docs/PostApiEventsRequestChannelsInner.md)
+ - [PostApiEventsRequestForSaleConfig](docs/PostApiEventsRequestForSaleConfig.md)
+ - [PostApiEventsRequestTableBookingConfig](docs/PostApiEventsRequestTableBookingConfig.md)
+ - [PostApiExtractSeats200Response](docs/PostApiExtractSeats200Response.md)
+ - [PostApiExtractSeats200ResponseSeatsInner](docs/PostApiExtractSeats200ResponseSeatsInner.md)
+ - [PostApiExtractSeats200ResponseSuggestedInner](docs/PostApiExtractSeats200ResponseSuggestedInner.md)
+ - [PostApiExtractSeatsRequest](docs/PostApiExtractSeatsRequest.md)
+ - [PostApiExtractSeatsRequestExamples](docs/PostApiExtractSeatsRequestExamples.md)
+ - [PostApiExtractSeatsRequestExamplesAnyOfInner](docs/PostApiExtractSeatsRequestExamplesAnyOfInner.md)
+ - [PostApiExtractSeatsRequestNegatives](docs/PostApiExtractSeatsRequestNegatives.md)
+ - [PostApiExtractSeatsRequestRegion](docs/PostApiExtractSeatsRequestRegion.md)
+ - [PostApiExtractSeatsRequestRegionAnyOf](docs/PostApiExtractSeatsRequestRegionAnyOf.md)
+ - [PostApiGaConfirm409Response](docs/PostApiGaConfirm409Response.md)
+ - [PostApiGaConfirmRequest](docs/PostApiGaConfirmRequest.md)
+ - [PostApiGaReleaseRequest](docs/PostApiGaReleaseRequest.md)
+ - [PostApiGaReserveRequest](docs/PostApiGaReserveRequest.md)
+ - [PostApiHoldTokensByTokenRequest](docs/PostApiHoldTokensByTokenRequest.md)
+ - [PostApiHoldTokensRequest](docs/PostApiHoldTokensRequest.md)
+ - [PostApiKeysRequest](docs/PostApiKeysRequest.md)
+ - [PostApiListingTypesRequest](docs/PostApiListingTypesRequest.md)
+ - [PostApiOrdersByOrderIdCancelRequest](docs/PostApiOrdersByOrderIdCancelRequest.md)
+ - [PostApiQuotesRequest](docs/PostApiQuotesRequest.md)
+ - [PostApiSandboxes201Response](docs/PostApiSandboxes201Response.md)
+ - [PostApiSandboxes201ResponseAdminKey](docs/PostApiSandboxes201ResponseAdminKey.md)
+ - [PostApiSandboxes201ResponseCopied](docs/PostApiSandboxes201ResponseCopied.md)
+ - [PostApiSandboxes201ResponseCopiedChartsInner](docs/PostApiSandboxes201ResponseCopiedChartsInner.md)
+ - [PostApiSandboxes201ResponseCopiedEventsInner](docs/PostApiSandboxes201ResponseCopiedEventsInner.md)
+ - [PostApiSandboxes201ResponseCopiedEventsWithOwnMapInner](docs/PostApiSandboxes201ResponseCopiedEventsWithOwnMapInner.md)
+ - [PostApiSandboxes201ResponseCopiedKeyConflictsInner](docs/PostApiSandboxes201ResponseCopiedKeyConflictsInner.md)
+ - [PostApiSandboxes201ResponseCopiedSeasonsInner](docs/PostApiSandboxes201ResponseCopiedSeasonsInner.md)
+ - [PostApiSandboxesBySandboxIdActionsCopyFromProduction200Response](docs/PostApiSandboxesBySandboxIdActionsCopyFromProduction200Response.md)
+ - [PostApiSandboxesBySandboxIdActionsCopyFromProductionRequest](docs/PostApiSandboxesBySandboxIdActionsCopyFromProductionRequest.md)
+ - [PostApiSandboxesBySandboxIdActionsJoin200Response](docs/PostApiSandboxesBySandboxIdActionsJoin200Response.md)
+ - [PostApiSandboxesBySandboxIdActionsReset200Response](docs/PostApiSandboxesBySandboxIdActionsReset200Response.md)
+ - [PostApiSandboxesBySandboxIdActionsResetRequest](docs/PostApiSandboxesBySandboxIdActionsResetRequest.md)
+ - [PostApiSandboxesBySandboxIdAdminKey201Response](docs/PostApiSandboxesBySandboxIdAdminKey201Response.md)
+ - [PostApiSandboxesBySandboxIdAdminKey201ResponseApiKey](docs/PostApiSandboxesBySandboxIdAdminKey201ResponseApiKey.md)
+ - [PostApiSandboxesBySandboxIdAdminKeyRequest](docs/PostApiSandboxesBySandboxIdAdminKeyRequest.md)
+ - [PostApiSandboxesRequest](docs/PostApiSandboxesRequest.md)
+ - [PostApiSeasonsBySeasonIdActionsAddEventsRequest](docs/PostApiSeasonsBySeasonIdActionsAddEventsRequest.md)
+ - [PostApiSeasonsBySeasonIdActionsCreateEventsRequest](docs/PostApiSeasonsBySeasonIdActionsCreateEventsRequest.md)
+ - [PostApiSeasonsBySeasonIdActionsCreateEventsRequestEventsInner](docs/PostApiSeasonsBySeasonIdActionsCreateEventsRequestEventsInner.md)
+ - [PostApiSeasonsBySeasonIdActionsRemoveEventsRequest](docs/PostApiSeasonsBySeasonIdActionsRemoveEventsRequest.md)
+ - [PostApiSeasonsBySeasonIdEventsRequest](docs/PostApiSeasonsBySeasonIdEventsRequest.md)
+ - [PostApiSeasonsBySeasonIdInventorySyncRequest](docs/PostApiSeasonsBySeasonIdInventorySyncRequest.md)
+ - [PostApiSeasonsBySeasonIdPartialSeasonsRequest](docs/PostApiSeasonsBySeasonIdPartialSeasonsRequest.md)
+ - [PostApiSeasonsRequest](docs/PostApiSeasonsRequest.md)
+ - [PostApiSeatsBestAvailableRequest](docs/PostApiSeatsBestAvailableRequest.md)
+ - [PostApiSeatsConfirm409Response](docs/PostApiSeatsConfirm409Response.md)
+ - [PostApiSeatsConfirmRequest](docs/PostApiSeatsConfirmRequest.md)
+ - [PostApiSeatsHoldsRenewRequest](docs/PostApiSeatsHoldsRenewRequest.md)
+ - [PostApiSeatsReleaseRequest](docs/PostApiSeatsReleaseRequest.md)
+ - [PostApiSeatsReserveRequest](docs/PostApiSeatsReserveRequest.md)
+ - [PostApiTeamInvitationsRequest](docs/PostApiTeamInvitationsRequest.md)
+ - [PostApiTicketBuyersRequest](docs/PostApiTicketBuyersRequest.md)
+ - [PostApiViewerTokensRequest](docs/PostApiViewerTokensRequest.md)
+ - [PostApiWebhooksRequest](docs/PostApiWebhooksRequest.md)
+ - [PostApiWorkspaces200Response](docs/PostApiWorkspaces200Response.md)
+ - [PostApiWorkspaces200ResponseApiKey](docs/PostApiWorkspaces200ResponseApiKey.md)
+ - [PostApiWorkspaces200ResponseTemplate](docs/PostApiWorkspaces200ResponseTemplate.md)
+ - [PostApiWorkspaces200ResponseTemplateWebhooksInner](docs/PostApiWorkspaces200ResponseTemplateWebhooksInner.md)
+ - [PostApiWorkspacesByWorkspaceIdActionsDelete200Response](docs/PostApiWorkspacesByWorkspaceIdActionsDelete200Response.md)
+ - [PostApiWorkspacesByWorkspaceIdActionsDeleteRequest](docs/PostApiWorkspacesByWorkspaceIdActionsDeleteRequest.md)
+ - [PostApiWorkspacesByWorkspaceIdInvitations201Response](docs/PostApiWorkspacesByWorkspaceIdInvitations201Response.md)
+ - [PostApiWorkspacesByWorkspaceIdInvitations201ResponseInvitation](docs/PostApiWorkspacesByWorkspaceIdInvitations201ResponseInvitation.md)
+ - [PostApiWorkspacesByWorkspaceIdInvitationsRequest](docs/PostApiWorkspacesByWorkspaceIdInvitationsRequest.md)
+ - [PostApiWorkspacesByWorkspaceIdKeys201Response](docs/PostApiWorkspacesByWorkspaceIdKeys201Response.md)
+ - [PostApiWorkspacesByWorkspaceIdKeys201ResponseApiKey](docs/PostApiWorkspacesByWorkspaceIdKeys201ResponseApiKey.md)
+ - [PostApiWorkspacesByWorkspaceIdKeysRequest](docs/PostApiWorkspacesByWorkspaceIdKeysRequest.md)
+ - [PostApiWorkspacesRequest](docs/PostApiWorkspacesRequest.md)
+ - [PostApiWorkspacesRequestIssueKey](docs/PostApiWorkspacesRequestIssueKey.md)
+ - [PutApiChartsByChartIdTagsRequest](docs/PutApiChartsByChartIdTagsRequest.md)
+ - [PutApiChartsByChartIdVersionsByVersionThumbnailRequest](docs/PutApiChartsByChartIdVersionsByVersionThumbnailRequest.md)
+ - [PutApiEventsByEventIdInventoryChannelsDefinitionsRequest](docs/PutApiEventsByEventIdInventoryChannelsDefinitionsRequest.md)
+ - [PutApiEventsByEventIdInventoryChannelsDefinitionsRequestChannelsInner](docs/PutApiEventsByEventIdInventoryChannelsDefinitionsRequestChannelsInner.md)
+ - [PutApiEventsByEventIdInventoryChannelsRequest](docs/PutApiEventsByEventIdInventoryChannelsRequest.md)
+ - [PutApiEventsByEventIdInventoryChannelsRequestAssignmentsInner](docs/PutApiEventsByEventIdInventoryChannelsRequestAssignmentsInner.md)
+ - [PutApiEventsByEventIdInventoryForSaleRequest](docs/PutApiEventsByEventIdInventoryForSaleRequest.md)
+ - [PutApiEventsByEventIdPricingRequest](docs/PutApiEventsByEventIdPricingRequest.md)
+ - [PutApiEventsByEventIdPricingRequestCategoriesInner](docs/PutApiEventsByEventIdPricingRequestCategoriesInner.md)
+ - [PutApiEventsByEventIdPricingRequestCategoriesInnerTicketTypesInner](docs/PutApiEventsByEventIdPricingRequestCategoriesInnerTicketTypesInner.md)
+ - [PutApiEventsByEventIdSalesRulesRequest](docs/PutApiEventsByEventIdSalesRulesRequest.md)
+ - [PutApiEventsByEventIdSalesRulesRequestBuyerLimit](docs/PutApiEventsByEventIdSalesRulesRequestBuyerLimit.md)
+ - [PutApiEventsByEventIdSalesRulesRequestLotPlansInner](docs/PutApiEventsByEventIdSalesRulesRequestLotPlansInner.md)
+ - [PutApiEventsByEventIdSalesRulesRequestLotPlansInnerLotsInner](docs/PutApiEventsByEventIdSalesRulesRequestLotPlansInnerLotsInner.md)
+ - [PutApiEventsByEventIdSalesRulesRequestQuotasInner](docs/PutApiEventsByEventIdSalesRulesRequestQuotasInner.md)
+ - [PutApiWorkspaceBuyerExtraDataRequest](docs/PutApiWorkspaceBuyerExtraDataRequest.md)
+ - [PutInternalStatusNoticesRequest](docs/PutInternalStatusNoticesRequest.md)
+ - [PutInternalStatusNoticesRequestNoticesInner](docs/PutInternalStatusNoticesRequestNoticesInner.md)
+
+
+## Documentation For Authorization
+
+
+Authentication schemes defined for the API:
+### BearerAuth
+
+- **Type**: HTTP Bearer token authentication
+
+Example
+
+```go
+auth := context.WithValue(context.Background(), seatschart.ContextAccessToken, "BEARER_TOKEN_STRING")
+r, err := client.Service.Operation(auth, args)
+```
+
+### ApiKeyAuth
+
+- **Type**: API key
+- **API key parameter name**: x-api-key
+- **Location**: HTTP header
+
+Note, each API key must be added to a map of `map[string]APIKey` where the key is: ApiKeyAuth and passed in as the auth context for each request.
+
+Example
+
+```go
+auth := context.WithValue(
+		context.Background(),
+		seatschart.ContextAPIKeys,
+		map[string]seatschart.APIKey{
+			"ApiKeyAuth": {Key: "API_KEY_STRING"},
+		},
+	)
+r, err := client.Service.Operation(auth, args)
+```
+
+
+## Documentation for Utility Methods
+
+Due to the fact that model structure members are all pointers, this package contains
+a number of utility functions to easily obtain pointers to values of basic types.
+Each of these functions takes a value of the given basic type and returns a pointer to it:
+
+* `PtrBool`
+* `PtrInt`
+* `PtrInt32`
+* `PtrInt64`
+* `PtrFloat`
+* `PtrFloat32`
+* `PtrFloat64`
+* `PtrString`
+* `PtrTime`
+
+## Author
+
+
+
